@@ -182,6 +182,8 @@ class VoxelDataset(Dataset):
 # 2) 3D U-Net Components
 # ----------------------------------------
 
+noise_dim = 32
+
 class DoubleConv(nn.Module):
     """(Conv3d → BN → ReLU) twice."""
     def __init__(self, in_ch, out_ch):
@@ -229,8 +231,18 @@ class GenUp(nn.Module):
         return self.conv(x)
 
 class UNet3D(nn.Module):
-    def __init__(self, in_channels=3, out_classes=3, features=[32, 64, 128, 256]):
+    def __init__(self, in_channels=6, out_classes=3, features=[32, 64, 128, 256]):
         super().__init__()
+
+        self.noise_proj = nn.Sequential(
+            nn.ConvTranspose3d(noise_dim, 3*2, kernel_size=4, stride=4),      # 1→4
+            nn.BatchNorm3d(3*2),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose3d(3*2, 3, kernel_size=33, stride=33),# 4→136
+            nn.BatchNorm3d(3),
+            nn.ReLU(inplace=True),
+        )
+
         # Encoder
         self.inc   = DoubleConv(in_channels, features[0])
         self.down1 = GenDown(features[0], features[1])
@@ -243,8 +255,17 @@ class UNet3D(nn.Module):
         # Final 1×1×1 conv to map to desired classes
         self.outc  = nn.Conv3d(features[0], out_classes, kernel_size=1)
 
-    def forward(self, x):
-        x0 = self.inc(x)        # → [B, f0, D, H, W]
+    def forward(self, x, z):
+
+        B, _, D, H, W = x.shape
+
+        z_vol = z.view(B, noise_dim, 1, 1, 1)
+        z_flat = self.noise_proj(z_vol)              # [B, project_to_ch * 64 * 64 * 64]
+        z_final = z_flat.view(B, 3, D, H, W)
+        
+        x_with_noise = torch.cat([x, z_final], dim=1)
+
+        x0 = self.inc(x_with_noise)        # → [B, f0, D, H, W]
         x1 = self.down1(x0)     # → [B, f1, D/2, H/2, W/2]
         x2 = self.down2(x1)     # → [B, f2, D/4, H/4, W/4]
         x3 = self.down3(x2)     # → [B, f3, D/8, H/8, W/8]
@@ -261,22 +282,29 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
     gen_model.train()
     disc_model.train()
     running_loss = 0.0
+    running_gen_loss = 0.0
+    running_real_loss = 0.0
+    running_fake_loss = 0.0
+    running_adv_loss = 0.0
     total = 0
     for volumes, targets in dataloader:
         volumes = volumes.to(device)
         targets = targets.to(device)
 
+        B = volumes.shape[0]
+        z = torch.randn(B, noise_dim, device=device) * 0.1
+
 
         #Generate our predicted values
         gen_optimizer.zero_grad()
-        gen_outputs = gen_model(volumes)
+        gen_outputs = gen_model(volumes, z)
 
         gen_loss = gen_criterion(gen_outputs, targets)
     
         disc_optimizer.zero_grad()
         disc_outputs = disc_model(targets)
 
-        real_loss = disc_criterion(disc_outputs, torch.ones_like(disc_outputs))
+        real_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.9))
 
 
         fake_output = torch.zeros_like(gen_outputs).scatter_(
@@ -289,7 +317,7 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
 
         disc_outputs = disc_model(fake_output)
 
-        fake_loss = disc_criterion(disc_outputs, torch.zeros_like(disc_outputs))
+        fake_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.1))
 
         (fake_loss + real_loss).backward()
         disc_optimizer.step()
@@ -314,7 +342,15 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
         
 
         running_loss += (gen_loss.item() + real_loss.item() + fake_loss.item() + adv_loss.item()) * volumes.size(0)
+        running_gen_loss += (gen_loss.item()) * volumes.size(0)
+        running_real_loss += (real_loss.item()) * volumes.size(0)
+        running_fake_loss += (fake_loss.item()) * volumes.size(0)
+        running_adv_loss += (adv_loss.item()) * volumes.size(0)
         total += volumes.size(0)
+    print("Current_gen:", running_gen_loss/total)
+    print("Current_real:", running_real_loss/total)
+    print("Current_fake:", running_fake_loss/total)
+    print("Current_adv:", running_adv_loss/total)
     print("Current:", running_loss/total)
 
     return running_loss / total
@@ -322,12 +358,13 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
 
 def main():
      # User-defined parameters (adjust to your data)
-    data_folder = "C:\\Users\\evans\\Documents\\Independent Study\\outputs"
+    data_folder = "C:\\Users\\evans\\Desktop\\Independent Study\\outputs"
     latent_dim  = 256               # size of VAE bottleneck
     base_ch     = 32                # number of filters in first layer
     batch_size  = 2                 # samples per GPU batch
     epochs      = 100               # training duration
-    lr          = 1e-4              # learning rate
+    gen_lr          = 1e-4              # learning rate
+    disc_lr          = 5e-6              # learning rate
 
 
 
@@ -343,24 +380,27 @@ def main():
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=1,
-        pin_memory=True
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True
     )
 
     # Instantiate model and begin training
-    gen_model = UNet3D()
-    disc_model = Discriminator3D()
+    gen_model = UNet3D().to(device)
+    disc_model = Discriminator3D().to(device)
 
 
-    gen_optimizer = torch.optim.Adam(gen_model.parameters(), lr=lr)
-    disc_optimizer = torch.optim.Adam(disc_model.parameters(), lr=lr)
+    gen_optimizer = torch.optim.Adam(gen_model.parameters(), lr=gen_lr)
+    disc_optimizer = torch.optim.Adam(disc_model.parameters(), lr=disc_lr)
     gen_criterion = nn.CrossEntropyLoss()
     disc_criterion = nn.BCEWithLogitsLoss()
 
-    num_epochs = 20
+    num_epochs = 100
 
     for epoch in range(num_epochs):
         train(gen_model, disc_model, loader, gen_optimizer, disc_optimizer, gen_criterion, disc_criterion, device)
+        print("^^^^^^^^^^^^^^ Epoch ", epoch, "^^^^^^^^^^^")
+        print("------------------------------")
 
     # Save weights for later use
     torch.save(gen_model.state_dict(), "unet3d_vae_checkpoint.pth")
