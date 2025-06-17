@@ -1,0 +1,6 @@
+#Constants
+TRAINING = 1
+RUNNING_INFERENCE = 2
+TESTING_POST_PROCESSING = 3
+
+noise_dim = 32
