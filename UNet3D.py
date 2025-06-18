@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-
+from Constants import noise_dim
+import torch.nn.functional as F
 
 class DoubleConv(nn.Module):
     """(Conv3d → BN → ReLU) twice."""
@@ -9,10 +10,10 @@ class DoubleConv(nn.Module):
         self.double_conv = nn.Sequential(
             nn.Conv3d(in_ch,  out_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm3d(out_ch),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm3d(out_ch),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
         )
     def forward(self, x):
         return self.double_conv(x)
@@ -55,11 +56,16 @@ class UNet3D(nn.Module):
         self.noise_proj = nn.Sequential(
             nn.ConvTranspose3d(noise_dim, 3*2, kernel_size=4, stride=4),      # 1→4
             nn.BatchNorm3d(3*2),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.ConvTranspose3d(3*2, 3, kernel_size=33, stride=33),# 4→136
             nn.BatchNorm3d(3),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
         )
+
+        self.FirstHidden_DoubleConv = DoubleConv(512, 256)
+        self.hidden_DoubleConv = DoubleConv(256, 256)
+        self.OtherDoubleConv = DoubleConv(512, 256)
+        self.relu = nn.ReLU(inplace=False)
 
         # Encoder
         self.inc   = DoubleConv(in_channels, features[0])
@@ -73,7 +79,7 @@ class UNet3D(nn.Module):
         # Final 1×1×1 conv to map to desired classes
         self.outc  = nn.Conv3d(features[0], out_classes, kernel_size=1)
 
-    def forward(self, x, z):
+    def forward(self, x, z, hidden):
 
         B, _, D, H, W = x.shape
 
@@ -87,9 +93,19 @@ class UNet3D(nn.Module):
         x1 = self.down1(x0)     # → [B, f1, D/2, H/2, W/2]
         x2 = self.down2(x1)     # → [B, f2, D/4, H/4, W/4]
         x3 = self.down3(x2)     # → [B, f3, D/8, H/8, W/8]
+
+
+        x3 = torch.cat([x3,hidden], dim=1)
+
+        new_hidden = self.FirstHidden_DoubleConv(x3)
+        new_hidden = self.relu(new_hidden)
+        new_hidden = self.hidden_DoubleConv(new_hidden)
+
+        x3 = self.OtherDoubleConv(x3)
+
         x  = self.up2(x3, x2)   # → [B, f2, D/4, H/4, W/4]
         x  = self.up1(x,  x1)   # → [B, f1, D/2, H/2, W/2]
         x  = self.up0(x,  x0)   # → [B, f0, D,   H,   W  ]
-        return self.outc(x)     # → [B, out_classes, D, H, W]
+        return self.outc(x),new_hidden     # → [B, out_classes, D, H, W]
 
 

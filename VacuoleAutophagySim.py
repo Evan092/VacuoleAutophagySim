@@ -1,6 +1,8 @@
 import argparse
 import datetime
+from functools import partial
 import os
+import random
 import time
 import numpy as np
 import torch
@@ -18,8 +20,11 @@ import numpy as np
 import datetime
 import argparse
 from Constants import *
-from VacuoleAutophagySim.Discrimnator3D import Discriminator3D
-from VacuoleAutophagySim.UNet3D import UNet3D
+from Discrimnator3D import Discriminator3D
+from UNet3D import UNet3D
+from CustomBatchSampler import CustomBatchSampler
+from VoxelDataset import VoxelDataset
+from torch.utils.data import DataLoader
 
 
 # ----------------------------------------
@@ -35,53 +40,81 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
     running_fake_loss = 0.0
     running_adv_loss = 0.0
     total = 0
-    for volumes, targets, _ in dataloader:
+    for volumes, targets, steps, _ in dataloader:
         volumes = volumes.to(device)
         targets = targets.to(device)
 
         B = volumes.shape[0]
-        z = torch.randn(B, noise_dim, device=device) * 0.1
 
+        hidden = torch.zeros(volumes.shape[0], 256, 16, 16, 16, device=device)
 
-        #Generate our predicted values
+        
+        #Zero_grad
         gen_optimizer.zero_grad()
-        gen_outputs = gen_model(volumes, z)
-
-        gen_loss = gen_criterion(gen_outputs, targets)
-    
         disc_optimizer.zero_grad()
-        disc_outputs = disc_model(targets)
 
-        real_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.9))
-
-
-        fake_output = torch.zeros_like(gen_outputs).scatter_(
-            dim=1,
-            index=gen_outputs.argmax(dim=1, keepdim=True),
-            value=1.0)
+        gen_outputs = volumes
 
 
-        fake_output = fake_output.detach()
 
-        disc_outputs = disc_model(fake_output)
+        gen_loss, fake_loss, real_loss,adv_loss = 0,0,0,0
+        torch.autograd.set_detect_anomaly(True)
 
-        fake_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.1))
+        for i in range(steps[0].item()):
+            weight = 1 / (1+i)
+            z = torch.randn(B, noise_dim, device=device) * 0.1 #random noise
+            gen_outputs, hidden = gen_model(gen_outputs, z, hidden)
+
+            hidden = hidden.detach()
+
+            gen_loss += gen_criterion(gen_outputs, targets) * weight
+
+            disc_outputs = disc_model(targets)
+
+            real_loss += disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.9)) * weight
+
+            fake_output = torch.zeros_like(gen_outputs).scatter(
+                dim=1,
+                index=gen_outputs.argmax(dim=1, keepdim=True),
+                value=1.0)
+
+
+            fake_output = fake_output.detach()
+
+            disc_outputs = disc_model(fake_output)
+
+            fake_loss += disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.1))  * weight
+
+            fake_output = torch.zeros_like(gen_outputs).scatter(
+                dim=1,
+                index=gen_outputs.argmax(dim=1, keepdim=True),
+                value=1.0)
+
+            disc_outputs2 = disc_model(fake_output)
+
+            adv_loss += disc_criterion(disc_outputs2, torch.ones_like(disc_outputs2)) * weight
+
+
+
+
+        #finalize generated loss
+        for p in disc_model.parameters():
+            p.requires_grad = False
+
+        (gen_loss + adv_loss).backward()
+        gen_optimizer.step()
+
+        for p in disc_model.parameters():
+            p.requires_grad = True
+
+        for p in gen_model.parameters():
+            p.requires_grad = False
 
         (fake_loss + real_loss).backward()
         disc_optimizer.step()
 
-        fake_output = torch.zeros_like(gen_outputs).scatter_(
-            dim=1,
-            index=gen_outputs.argmax(dim=1, keepdim=True),
-            value=1.0)
-
-        disc_outputs2 = disc_model(fake_output)
-
-        adv_loss = disc_criterion(disc_outputs2, torch.ones_like(disc_outputs2))
-
-        #finalize generated loss
-        (gen_loss + adv_loss).backward()
-        gen_optimizer.step()
+        for p in gen_model.parameters():
+            p.requires_grad = True
 
         print("Gen_Loss: ", gen_loss.item())
         print("real_Loss: ", real_loss.item())
@@ -95,19 +128,13 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
         running_fake_loss += (fake_loss.item()) * volumes.size(0)
         running_adv_loss += (adv_loss.item()) * volumes.size(0)
         total += volumes.size(0)
-    print("Current_gen:", running_gen_loss/total)
-    print("Current_real:", running_real_loss/total)
-    print("Current_fake:", running_fake_loss/total)
-    print("Current_adv:", running_adv_loss/total)
-    print("Current:", running_loss/total)
 
-    with open("log.txt", "a") as f:
-        f.write("Current_gen:" + str( running_gen_loss/total) + "\n")
-        f.write("Current_real:" + str(  running_real_loss/total) + "\n")
-        f.write("Current_fake:" + str(  running_fake_loss/total) + "\n")
-        f.write("Current_adv:" + str(  running_adv_loss/total) + "\n")
-        f.write("Current:" + str(  running_loss/total) + "\n")
-        f.write("------------------------------------------" + "\n")
+    printAndLog("Current_gen:" + str( running_gen_loss/total) + "\n")
+    printAndLog("Current_real:" + str(  running_real_loss/total) + "\n")
+    printAndLog("Current_fake:" + str(  running_fake_loss/total) + "\n")
+    printAndLog("Current_adv:" + str(  running_adv_loss/total) + "\n")
+    printAndLog("Current_sum:" + str(  running_loss/total) + "\n")
+    printAndLog("------------------------------------------" + "\n")
 
     return running_loss / total
 
@@ -143,7 +170,7 @@ def evaluate(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, g
             real_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.9))
 
 
-            fake_output = torch.zeros_like(gen_outputs).scatter_(
+            fake_output = torch.zeros_like(gen_outputs).scatter(
                 dim=1,
                 index=gen_outputs.argmax(dim=1, keepdim=True),
                 value=1.0)
@@ -156,7 +183,7 @@ def evaluate(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, g
             fake_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.1))
 
 
-            fake_output = torch.zeros_like(gen_outputs).scatter_(
+            fake_output = torch.zeros_like(gen_outputs).scatter(
                 dim=1,
                 index=gen_outputs.argmax(dim=1, keepdim=True),
                 value=1.0)
@@ -479,17 +506,16 @@ def printAndLog(myString):
     with open("log.txt", "a") as f:
         f.write(myString + "\n")
 
-
 def main():
 
     parser = argparse.ArgumentParser()
     #Training related parameters
-    parser.add_argument('--train', type=str, default="", help='Path to CSV for dataset')
+    parser.add_argument('--train', type=str, default="C:\\Users\\evans\\Desktop\\Independent Study\\outputs", help='Path to CSV for dataset')
     parser.add_argument('--batchSize', type=int, default=2, help='Path to CSV for dataset')
     parser.add_argument('--epochs', type=int, default=100, help='Number of Epochs to run')
     parser.add_argument('--gen_lr', type=float, default=1e-4, help='Number of Epochs to run')
     parser.add_argument('--disc_lr', type=float, default=1.5e-6, help='Number of Epochs to run')
-    parser.add_argument('--num_workers', type=int, default=12, help='Number of workers to use')
+    parser.add_argument('--num_workers', type=int, default=2, help='Number of workers to use')
     parser.add_argument('--shuffle', type=bool, default=True, help='Number of workers to use')
     parser.add_argument('--pin_memory', type=bool, default=True, help='Number of workers to use')
     parser.add_argument('--persistent_workers', type=bool, default=True, help='Number of workers to use')
@@ -502,8 +528,8 @@ def main():
 
 
     #Works for train or inference
-    parser.add_argument('--genCheckpoint', type=str, default="", help="Path to the generator's .pth checkpoint file")
-    parser.add_argument('--discCheckpoint', type=str, default="", help="Path to the discriminator's .pth checkpoint file")
+    parser.add_argument('--gen_checkpoint', type=str, default="", help="Path to the generator's .pth checkpoint file")
+    parser.add_argument('--disc_checkpoint', type=str, default="", help="Path to the discriminator's .pth checkpoint file")
 
     #Required
     parser.add_argument('--output', type=str, default="", help='Output Folder')
@@ -525,27 +551,35 @@ def main():
 
     dataset = VoxelDataset(data_folder)
 
+    customBatchSampler = CustomBatchSampler(dataset, batch_size, shuffle=args.shuffle)
+
     loader  = DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=args.shuffle,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
+        batch_sampler=customBatchSampler,
         persistent_workers=args.persistent_workers
+        
     )
 
     # Instantiate model
     gen_model = UNet3D().to(device)
     disc_model = Discriminator3D().to(device)
 
+    gen_state = None
+    disc_state = None
+    gen_epoch = 1
+    disc_epoch = 1
 
     if args.gen_checkpoint == "": #No checkpoint specified, TODO use the latest in the checkpoint folder
-        gen_state  = torch.load("gen_check/latest.pth",  map_location=device)
+        if os.path.exists("gen_check/latest.pth"):
+            gen_state  = torch.load("gen_check/latest.pth",  map_location=device)
     else:
         gen_state  = torch.load(args.gen_checkpoint,  map_location=device)
     
     if args.disc_checkpoint == "":  #No checkpoint specified, TODO use the latest in the checkpoint folder
-        disc_state = torch.load("disc_check/latest.pth", map_location=device)
+        if os.path.exists("gen_check/latest.pth"):
+            disc_state = torch.load("disc_check/latest.pth", map_location=device)
     else:
         disc_state = torch.load(args.disc_checkpoint, map_location=device)
     
@@ -590,8 +624,8 @@ def main():
 
 
     for i in range(epochs):
-        printAndLog("Starting Epoch ", gen_epoch + i, " for the generator.")
-        printAndLog("Starting Epoch ", disc_epoch + i, " for the discriminator.")
+        printAndLog("Starting Epoch " + str(gen_epoch + i) + " for the generator.")
+        printAndLog("Starting Epoch " + str(disc_epoch + i) + " for the discriminator.")
 
 
         if runMode == TRAINING:

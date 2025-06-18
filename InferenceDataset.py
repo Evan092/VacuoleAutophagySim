@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from VacuoleAutophagySim.Utils import parse_voxel_file
 from torch.utils.data import Dataset

@@ -1,8 +1,10 @@
 import os
+import random
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from VacuoleAutophagySim.Utils import parse_voxel_file
+from Utils import parse_voxel_file
 
 class VoxelDataset(Dataset):
     """
@@ -21,9 +23,11 @@ class VoxelDataset(Dataset):
     def __len__(self):
         return len(self.paths)
 
-    def __getitem__(self, idx):
-        if idx >= len(self.paths)-1:
-            idx -= 1
+    def __getitem__(self, key):
+
+        idx, outIdx = key
+
+
         # parse to numpy volume, convert to tensor with channel dim
         inputVol = parse_voxel_file(self.paths[idx])
         inputTensor = torch.from_numpy(inputVol) #.unsqueeze(0)  # shape [1, D, H, W]
@@ -45,8 +49,8 @@ class VoxelDataset(Dataset):
                 gt_instances[(ch, id_)] = mask
 
 
-        outputVol = parse_voxel_file(self.paths[idx+1])
+        outputVol = parse_voxel_file(self.paths[outIdx])
         targetTensor = torch.from_numpy(outputVol)#.unsqueeze(0)  # shape [1, D, H, W]
         if self.transform:
             targetTensor = self.transform(targetTensor)
-        return inputTensor, targetTensor, gt_instances
+        return inputTensor, targetTensor, outIdx-idx, gt_instances
