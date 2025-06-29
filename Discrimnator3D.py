@@ -1,7 +1,7 @@
 import torch.nn as nn
 
 class Discriminator3D(nn.Module):
-    def __init__(self, in_channels=3, base_channels=32):
+    def __init__(self, in_channels=3, base_channels=8):
         super(Discriminator3D, self).__init__()
         # Downsample block: Conv3d -> BatchNorm3d -> LeakyReLU
         def down_block(in_ch, out_ch, stride=2, padding=1):

@@ -27,6 +27,10 @@ from VoxelDataset import VoxelDataset
 from torch.utils.data import DataLoader
 
 
+def set_requires_grad(model, req_grad):
+    for p in model.parameters():
+        p.requires_grad = req_grad
+
 # ----------------------------------------
 # 4) Main Script
 # ----------------------------------------
@@ -39,41 +43,36 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
     running_real_loss = 0.0
     running_fake_loss = 0.0
     running_adv_loss = 0.0
+
+    real_weight = 1
+    fake_weight = 1
+
+    adv_weight = 1.5
+    gen_weight = 0.05
+
     total = 0
     for volumes, targets, steps, _ in dataloader:
+
         volumes = volumes.to(device)
         targets = targets.to(device)
 
-        B = volumes.shape[0]
+        for i in range(4):
+            B = volumes.shape[0]
+            z = torch.randn(B, noise_dim, device=device) * 0.1
 
-        hidden = torch.zeros(volumes.shape[0], 256, 16, 16, 16, device=device)
+            #Generate our predicted values
+            gen_optimizer.zero_grad()
+            gen_outputs = gen_model(volumes, z, steps[0].item())
 
+            gen_loss = gen_criterion(gen_outputs, targets)
         
-        #Zero_grad
-        gen_optimizer.zero_grad()
-        disc_optimizer.zero_grad()
-
-        gen_outputs = volumes
-
-
-
-        gen_loss, fake_loss, real_loss,adv_loss = 0,0,0,0
-        torch.autograd.set_detect_anomaly(True)
-
-        for i in range(steps[0].item()):
-            weight = 1 / (1+i)
-            z = torch.randn(B, noise_dim, device=device) * 0.1 #random noise
-            gen_outputs, hidden = gen_model(gen_outputs, z, hidden)
-
-            hidden = hidden.detach()
-
-            gen_loss += gen_criterion(gen_outputs, targets) * weight
-
+            disc_optimizer.zero_grad()
             disc_outputs = disc_model(targets)
 
-            real_loss += disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.9)) * weight
+            real_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.85)) #0.9?
 
-            fake_output = torch.zeros_like(gen_outputs).scatter(
+
+            fake_output = torch.zeros_like(gen_outputs).scatter_(
                 dim=1,
                 index=gen_outputs.argmax(dim=1, keepdim=True),
                 value=1.0)
@@ -83,52 +82,45 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
 
             disc_outputs = disc_model(fake_output)
 
-            fake_loss += disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.1))  * weight
+            fake_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.15)) #0.1?
 
-            fake_output = torch.zeros_like(gen_outputs).scatter(
+            if i == 1:
+                set_requires_grad(gen_model, False)
+                ((fake_loss * fake_weight) + (real_loss*real_weight)).backward()
+                disc_optimizer.step()
+                set_requires_grad(gen_model, True)
+
+            fake_output = torch.zeros_like(gen_outputs).scatter_(
                 dim=1,
                 index=gen_outputs.argmax(dim=1, keepdim=True),
                 value=1.0)
 
             disc_outputs2 = disc_model(fake_output)
 
-            adv_loss += disc_criterion(disc_outputs2, torch.ones_like(disc_outputs2)) * weight
+            adv_loss = disc_criterion(disc_outputs2, torch.ones_like(disc_outputs2))
 
+            #finalize generated loss
+            set_requires_grad(disc_model, False)
+            ((gen_loss*gen_weight) + (adv_loss*adv_weight)).backward()
+            gen_optimizer.step()
+            set_requires_grad(disc_model, True)
 
-
-
-        #finalize generated loss
-        for p in disc_model.parameters():
-            p.requires_grad = False
-
-        (gen_loss + adv_loss).backward()
-        gen_optimizer.step()
-
-        for p in disc_model.parameters():
-            p.requires_grad = True
-
-        for p in gen_model.parameters():
-            p.requires_grad = False
-
-        (fake_loss + real_loss).backward()
-        disc_optimizer.step()
-
-        for p in gen_model.parameters():
-            p.requires_grad = True
-
-        print("Gen_Loss: ", gen_loss.item())
-        print("real_Loss: ", real_loss.item())
-        print("fake_Loss: ", fake_loss.item())
-        print("adv_Loss: ", adv_loss.item())
+            if i == 0:
+                print("Steps: ", steps[0].item())
+                print("Gen_Loss: ", gen_loss.item())
+                print("real_Loss: ", real_loss.item())
+                print("fake_Loss: ", fake_loss.item())
+                print("adv_Loss: ", adv_loss.item())
         
 
-        running_loss += (gen_loss.item() + real_loss.item() + fake_loss.item() + adv_loss.item()) * volumes.size(0)
-        running_gen_loss += (gen_loss.item()) * volumes.size(0)
-        running_real_loss += (real_loss.item()) * volumes.size(0)
-        running_fake_loss += (fake_loss.item()) * volumes.size(0)
-        running_adv_loss += (adv_loss.item()) * volumes.size(0)
-        total += volumes.size(0)
+                running_loss += (gen_loss.item() + real_loss.item() + fake_loss.item() + adv_loss.item()) * volumes.size(0)
+                running_gen_loss += (gen_loss.item()) * volumes.size(0)
+                running_real_loss += (real_loss.item()) * volumes.size(0)
+                running_fake_loss += (fake_loss.item()) * volumes.size(0)
+                running_adv_loss += (adv_loss.item()) * volumes.size(0)
+                total += volumes.size(0)
 
+    printAndLog("\n")
     printAndLog("Current_gen:" + str( running_gen_loss/total) + "\n")
     printAndLog("Current_real:" + str(  running_real_loss/total) + "\n")
     printAndLog("Current_fake:" + str(  running_fake_loss/total) + "\n")
@@ -512,10 +504,10 @@ def main():
     #Training related parameters
     parser.add_argument('--train', type=str, default="C:\\Users\\evans\\Desktop\\Independent Study\\outputs", help='Path to CSV for dataset')
     parser.add_argument('--batchSize', type=int, default=2, help='Path to CSV for dataset')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of Epochs to run')
-    parser.add_argument('--gen_lr', type=float, default=1e-4, help='Number of Epochs to run')
-    parser.add_argument('--disc_lr', type=float, default=1.5e-6, help='Number of Epochs to run')
-    parser.add_argument('--num_workers', type=int, default=2, help='Number of workers to use')
+    parser.add_argument('--epochs', type=int, default=1000, help='Number of Epochs to run')
+    parser.add_argument('--gen_lr', type=float, default=4e-4, help='Generator Learning Rate')
+    parser.add_argument('--disc_lr', type=float, default=2.5e-5, help='Number of Epochs to run')
+    parser.add_argument('--num_workers', type=int, default=12, help='Number of workers to use')
     parser.add_argument('--shuffle', type=bool, default=True, help='Number of workers to use')
     parser.add_argument('--pin_memory', type=bool, default=True, help='Number of workers to use')
     parser.add_argument('--persistent_workers', type=bool, default=True, help='Number of workers to use')
@@ -545,6 +537,11 @@ def main():
     epochs      = args.epochs       # training duration
     gen_lr      = args.gen_lr       # generator learning rate
     disc_lr     = args.disc_lr      # discriminator learning rate
+
+    printAndLog("batch_size: " + str(batch_size))
+    printAndLog("epochs to do: " + str(epochs))
+    printAndLog("gen_lr: " + str(gen_lr))
+    printAndLog("disc_lr: " + str(disc_lr))
 
     # Setup PyTorch device and data loader
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -578,7 +575,7 @@ def main():
         gen_state  = torch.load(args.gen_checkpoint,  map_location=device)
     
     if args.disc_checkpoint == "":  #No checkpoint specified, TODO use the latest in the checkpoint folder
-        if os.path.exists("gen_check/latest.pth"):
+        if os.path.exists("disc_check/latest.pth"):
             disc_state = torch.load("disc_check/latest.pth", map_location=device)
     else:
         disc_state = torch.load(args.disc_checkpoint, map_location=device)
@@ -587,16 +584,16 @@ def main():
 
     if gen_state: #We loaded a checkpoint. (We wouldn't if it was the first run)
         gen_epoch = gen_state['epoch'] #Load the checkpoint the generator was on
-        gen_model.load_state_dict(gen_state) #Load the weights and biases
+        gen_model.load_state_dict(gen_state['model_state_dict']) #Load the weights and biases
 
     if disc_state: #We loaded a checkpoint. (We wouldn't if it was the first run)
         disc_epoch = disc_state['epoch'] #Load the checkpoint the discriminator was on
-        disc_model.load_state_dict(disc_state) #Load the weights and biases
+        disc_model.load_state_dict(disc_state['model_state_dict']) #Load the weights and biases
 
 
     #Create the optimizers
     gen_optimizer = torch.optim.Adam(gen_model.parameters(), lr=gen_lr)
-    disc_optimizer = torch.optim.Adam(disc_model.parameters(), lr=disc_lr)
+    disc_optimizer = torch.optim.Adam(disc_model.parameters(), lr=disc_lr, betas=(0.1, 0.9))
 
 
     

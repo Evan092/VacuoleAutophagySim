@@ -13,6 +13,10 @@ def main():
     os.makedirs(sim_dest, exist_ok=True)
 
     runs_dir = os.path.join(os.getcwd(), "runs")
+
+    if not os.path.exists(os.getcwd() + "runs"):
+        os.makedirs(os.getcwd() + "runs")
+        
     for run_name in sorted(os.listdir(runs_dir)):
         run_path = os.path.join(runs_dir, run_name)
         if not os.path.isdir(run_path):
