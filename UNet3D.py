@@ -42,10 +42,12 @@ class DoubleConv(nn.Module):
         super().__init__()
         self.double_conv = nn.Sequential(
             nn.Conv3d(in_ch,  out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(out_ch),
+            #nn.BatchNorm3d(out_ch),
+            nn.GroupNorm(num_groups=8, num_channels=out_ch),
             nn.ReLU(inplace=False),
             nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm3d(out_ch),
+            #nn.BatchNorm3d(out_ch),
+            nn.GroupNorm(num_groups=8, num_channels=out_ch),
             nn.ReLU(inplace=False),
         )
     def forward(self, x):
@@ -83,15 +85,17 @@ class GenUp(nn.Module):
         return self.conv(x)
 
 class UNet3D(nn.Module):
-    def __init__(self, in_channels=7, out_classes=3, features=[32, 64, 128, 256]):
+    def __init__(self, in_channels=7, out_classes=3, features=[32, 64, 128, 256, 512]):
         super().__init__()
 
         self.noise_proj = nn.Sequential(
             nn.ConvTranspose3d(noise_dim, 3*2, kernel_size=4, stride=4),      # 1→4
-            nn.BatchNorm3d(3*2),
+            #nn.BatchNorm3d(3*2),
+            nn.GroupNorm(num_groups=6, num_channels=3*2),
             nn.ReLU(inplace=False),
             nn.ConvTranspose3d(3*2, 3, kernel_size=33, stride=33),# 4→136
-            nn.BatchNorm3d(3),
+            #nn.BatchNorm3d(3),
+            nn.GroupNorm(num_groups=3, num_channels=3),
             nn.ReLU(inplace=False),
         )
 
@@ -100,16 +104,25 @@ class UNet3D(nn.Module):
         self.down1 = GenDown(features[0], features[1])
         self.down2 = GenDown(features[1], features[2])
         self.down3 = GenDown(features[2], features[3])
+        self.down4 = GenDown(features[3], features[4])
 
         #Attention
-        self.attention = SelfAttention3D(features[3])
+        self.attention = SelfAttention3D(features[4])
         # Decoder
+        self.up3   = GenUp(features[4], features[3])
         self.up2   = GenUp(features[3], features[2])
         self.up1   = GenUp(features[2], features[1])
         self.up0   = GenUp(features[1], features[0])
         # Final 1×1×1 conv to map to desired classes
         self.outc  = nn.Conv3d(features[0], out_classes, kernel_size=1)
-        
+
+
+        self.convD3 = nn.Conv3d(features[3], features[3], kernel_size=3, padding=1, stride=1)
+        self.convD4 = nn.Conv3d(features[4], features[4], kernel_size=3, padding=1, stride=1)
+
+        self.convU3 = nn.Conv3d(features[3], features[3], kernel_size=3, padding=1, stride=1)
+        self.convU2 = nn.Conv3d(features[2], features[2], kernel_size=3, padding=1, stride=1)
+        self.relu = nn.ReLU(inplace=False)
 
     def forward(self, x, z, steps):
 
@@ -128,10 +141,23 @@ class UNet3D(nn.Module):
         x1 = self.down1(x0)     # → [B, f1, D/2, H/2, W/2]
         x2 = self.down2(x1)     # → [B, f2, D/4, H/4, W/4]
         x3 = self.down3(x2)     # → [B, f3, D/8, H/8, W/8]
+        x3 = self.convD3(x3)
+        x3 = self.relu(x3)
+        x4 = self.down4(x3)     # → [B, f3, D/8, H/8, W/8]
+        x4 = self.convD4(x4)
+        x4 = self.relu(x4)
 
-        x3 = self.attention(x3)
+        x4 = self.attention(x4)
+
+        x  = self.up3(x4, x3)   # → [B, f2, D/4, H/4, W/4]
+        x = self.convU3(x)
+        x = self.relu(x)
 
         x  = self.up2(x3, x2)   # → [B, f2, D/4, H/4, W/4]
+
+        x = self.convU2(x)
+        x = self.relu(x)
+
         x  = self.up1(x,  x1)   # → [B, f1, D/2, H/2, W/2]
         x  = self.up0(x,  x0)   # → [B, f0, D,   H,   W  ]
         return self.outc(x)     # → [B, out_classes, D, H, W]

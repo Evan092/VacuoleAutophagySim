@@ -14,9 +14,9 @@ class VoxelDataset(Dataset):
     def __init__(self, folder, transform=None):
         # collect all .txt or .piff files in folder
         self.paths = [
-            os.path.join(folder, f)
-            for f in os.listdir(folder)
-            if f.endswith('.txt') or f.endswith('.piff')
+            os.path.join(folder, d)
+            for d in os.listdir(folder)
+            if os.path.isdir(os.path.join(folder, d))
         ]
         self.transform = transform
 
@@ -24,17 +24,19 @@ class VoxelDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, key):
-
-        idx, outIdx = key
-
+        #idx, outIdx = key
+        idx, outputNumber, startStep, nSteps = key
 
         # parse to numpy volume, convert to tensor with channel dim
-        inputVol = parse_voxel_file(self.paths[idx])
+
+
+        output = f"outputs_{outputNumber:02d}"
+        inputVol = parse_voxel_file(self.paths[idx] + "\\" + output + f"\\output{startStep:03d}.piff")
         inputTensor = torch.from_numpy(inputVol) #.unsqueeze(0)  # shape [1, D, H, W]
         if self.transform:
             inputTensor = self.transform(inputTensor)
 
-        IDVol = parse_voxel_file(self.paths[idx])
+        IDVol = parse_voxel_file(self.paths[idx] + "\\" + output + f"\\output{startStep:03d}.piff")
         IDTensor = torch.from_numpy(IDVol) #.unsqueeze(0)  # shape [1, D, H, W]
 
         gt_instances = {}
@@ -49,8 +51,26 @@ class VoxelDataset(Dataset):
                 gt_instances[(ch, id_)] = mask
 
 
-        outputVol = parse_voxel_file(self.paths[outIdx])
+        outputVol = parse_voxel_file(self.paths[idx] + "\\" + output + f"\\output{(startStep+nSteps):03d}.piff")
         targetTensor = torch.from_numpy(outputVol)#.unsqueeze(0)  # shape [1, D, H, W]
         if self.transform:
             targetTensor = self.transform(targetTensor)
-        return inputTensor, targetTensor, outIdx-idx, gt_instances
+
+
+        xFlip = random.randint(0,1)
+        yFlip = random.randint(0,1)
+        zFlip = random.randint(0,1)
+
+        flips = []
+
+        if xFlip == 1:
+            flips.append(1)
+        if yFlip == 1:
+            flips.append(2)
+        if zFlip == 1:
+            flips.append(3)
+
+        inputTensor = torch.flip(inputTensor, dims=flips)
+        targetTensor = torch.flip(targetTensor, dims=flips)
+
+        return inputTensor, targetTensor, nSteps, gt_instances

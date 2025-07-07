@@ -17,12 +17,20 @@ class CustomBatchSampler(Sampler):
 
         for i in range(0, len(all_idxs), self.batch_size):
             batch_idxs = all_idxs[i:i + self.batch_size]
-            n = random.randint(1, self.maxSteps)  # fixed horizon per batch
+            nSteps = random.randint(1, self.maxSteps)  # fixed horizon per batch
 
             batch_keys = []
             for idx in batch_idxs:
                 idx0 = idx - self.maxSteps if idx >= self.threshold else idx
-                batch_keys.append((idx0, idx0 + n))
+
+                outputNumber = random.randint(1, 5)
+
+                startStep = random.randint(1, 98)
+
+                startStep = min(startStep,99-nSteps)
+
+
+                batch_keys.append((idx0, outputNumber, startStep, nSteps))
             yield batch_keys
 
     def __len__(self):

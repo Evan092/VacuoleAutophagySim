@@ -8,7 +8,8 @@ class Discriminator3D(nn.Module):
             return nn.Sequential(
                 nn.Conv3d(in_ch, out_ch, kernel_size=4, stride=stride, padding=padding, bias=False),
                 nn.BatchNorm3d(out_ch),
-                nn.LeakyReLU(0.2, inplace=True)
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Dropout(0.1)
             )
         
         # Initial conv (no batchnorm)

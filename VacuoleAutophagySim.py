@@ -3,6 +3,7 @@ import datetime
 from functools import partial
 import os
 import random
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import time
 import numpy as np
 import torch
@@ -23,6 +24,7 @@ from Constants import *
 from Discrimnator3D import Discriminator3D
 from UNet3D import UNet3D
 from CustomBatchSampler import CustomBatchSampler
+from AccuracyTest import runAccuracyTest
 from VoxelDataset import VoxelDataset
 from torch.utils.data import DataLoader
 
@@ -35,7 +37,11 @@ def set_requires_grad(model, req_grad):
 # 4) Main Script
 # ----------------------------------------
 
-def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_criterion, disc_criterion, device):
+skipNextDiscBackProp = False
+skipNextGenBackProp = False
+
+def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_criterion, disc_criterion, device, epochNumber):
+    global skipNextDiscBackProp, skipNextGenBackProp
     gen_model.train()
     disc_model.train()
     running_loss = 0.0
@@ -47,78 +53,75 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
     real_weight = 1
     fake_weight = 1
 
-    adv_weight = 1.5
-    gen_weight = 0.05
+    adv_weight = 1
+    gen_weight = 0.5
 
     total = 0
-    for volumes, targets, steps, _ in dataloader:
 
+    for volumes, targets, steps, _ in dataloader:
         volumes = volumes.to(device)
         targets = targets.to(device)
 
-        for i in range(4):
-            B = volumes.shape[0]
-            z = torch.randn(B, noise_dim, device=device) * 0.1
+        B = volumes.shape[0]
+        z = torch.randn(B, noise_dim, device=device) * 0.1
 
-            #Generate our predicted values
-            gen_optimizer.zero_grad()
-            gen_outputs = gen_model(volumes, z, steps[0].item())
+        #Generate our predicted values
+        gen_optimizer.zero_grad()
+        gen_outputs = gen_model(volumes, z, steps[0].item())
 
-            gen_loss = gen_criterion(gen_outputs, targets)
-        
-            disc_optimizer.zero_grad()
-            disc_outputs = disc_model(targets)
+        gen_loss = gen_criterion(gen_outputs, targets)
+    
+        disc_optimizer.zero_grad()
+        disc_outputs = disc_model(targets)
 
-            real_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.85)) #0.9?
-
-
-            fake_output = torch.zeros_like(gen_outputs).scatter_(
-                dim=1,
-                index=gen_outputs.argmax(dim=1, keepdim=True),
-                value=1.0)
+        real_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.9)) #0.9?
 
 
-            fake_output = fake_output.detach()
+        fake_output = torch.zeros_like(gen_outputs).scatter_(
+            dim=1,
+            index=gen_outputs.argmax(dim=1, keepdim=True),
+            value=1.0)
 
-            disc_outputs = disc_model(fake_output)
 
-            fake_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.15)) #0.1?
+        fake_output = fake_output.detach()
 
-            if i == 1:
-                set_requires_grad(gen_model, False)
-                ((fake_loss * fake_weight) + (real_loss*real_weight)).backward()
-                disc_optimizer.step()
-                set_requires_grad(gen_model, True)
+        disc_outputs = disc_model(fake_output)
 
-            fake_output = torch.zeros_like(gen_outputs).scatter_(
-                dim=1,
-                index=gen_outputs.argmax(dim=1, keepdim=True),
-                value=1.0)
+        fake_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.1)) #0.1?
 
-            disc_outputs2 = disc_model(fake_output)
+        set_requires_grad(gen_model, False)
+        ((fake_loss * fake_weight) + (real_loss*real_weight)).backward()
+        disc_optimizer.step()
+        set_requires_grad(gen_model, True)
 
-            adv_loss = disc_criterion(disc_outputs2, torch.ones_like(disc_outputs2))
+        fake_output = torch.zeros_like(gen_outputs).scatter_(
+            dim=1,
+            index=gen_outputs.argmax(dim=1, keepdim=True),
+            value=1.0)
 
-            #finalize generated loss
+        disc_outputs2 = disc_model(fake_output)
+
+        adv_loss = disc_criterion(disc_outputs2, torch.ones_like(disc_outputs2))
+
+        #finalize generated loss
+        if not skipNextGenBackProp or True:
             set_requires_grad(disc_model, False)
             ((gen_loss*gen_weight) + (adv_loss*adv_weight)).backward()
             gen_optimizer.step()
             set_requires_grad(disc_model, True)
 
-            if i == 0:
-                print("Steps: ", steps[0].item())
-                print("Gen_Loss: ", gen_loss.item())
-                print("real_Loss: ", real_loss.item())
-                print("fake_Loss: ", fake_loss.item())
-                print("adv_Loss: ", adv_loss.item())
-        
+        print("Steps: ", steps[0].item())
+        print("Gen_Loss: ", gen_loss.item())
+        print("real_Loss: ", real_loss.item())
+        print("fake_Loss: ", fake_loss.item())
+        print("adv_Loss: ", adv_loss.item())
 
-                running_loss += (gen_loss.item() + real_loss.item() + fake_loss.item() + adv_loss.item()) * volumes.size(0)
-                running_gen_loss += (gen_loss.item()) * volumes.size(0)
-                running_real_loss += (real_loss.item()) * volumes.size(0)
-                running_fake_loss += (fake_loss.item()) * volumes.size(0)
-                running_adv_loss += (adv_loss.item()) * volumes.size(0)
-                total += volumes.size(0)
+        running_loss += (gen_loss.item() + real_loss.item() + fake_loss.item() + adv_loss.item()) * volumes.size(0)
+        running_gen_loss += (gen_loss.item()) * volumes.size(0)
+        running_real_loss += (real_loss.item()) * volumes.size(0)
+        running_fake_loss += (fake_loss.item()) * volumes.size(0)
+        running_adv_loss += (adv_loss.item()) * volumes.size(0)
+        total += volumes.size(0)
 
     printAndLog("\n")
     printAndLog("Current_gen:" + str( running_gen_loss/total) + "\n")
@@ -127,6 +130,19 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
     printAndLog("Current_adv:" + str(  running_adv_loss/total) + "\n")
     printAndLog("Current_sum:" + str(  running_loss/total) + "\n")
     printAndLog("------------------------------------------" + "\n")
+
+    if (running_adv_loss/total) > 0.8 and epochNumber > 20:
+        skipNextDiscBackProp = True
+        print("adv_loss > 0.8, Skipping Discriminator BackProp next epoch")
+    else:
+        skipNextDiscBackProp = False
+
+
+    if (running_adv_loss/total) < 0.6 and epochNumber > 20:
+        skipNextGenBackProp = True
+        print("adv_loss < 0.6, Skipping Generator BackProp next epoch")
+    else:
+        skipNextGenBackProp = False
 
     return running_loss / total
 
@@ -502,15 +518,15 @@ def main():
 
     parser = argparse.ArgumentParser()
     #Training related parameters
-    parser.add_argument('--train', type=str, default="C:\\Users\\evans\\Desktop\\Independent Study\\outputs", help='Path to CSV for dataset')
+    parser.add_argument('--train', type=str, default="D:\\runs", help='Path to CSV for dataset')
     parser.add_argument('--batchSize', type=int, default=2, help='Path to CSV for dataset')
     parser.add_argument('--epochs', type=int, default=1000, help='Number of Epochs to run')
-    parser.add_argument('--gen_lr', type=float, default=4e-4, help='Generator Learning Rate')
-    parser.add_argument('--disc_lr', type=float, default=2.5e-5, help='Number of Epochs to run')
+    parser.add_argument('--gen_lr', type=float, default=4e-4, help='Learning rate for the Generator')
+    parser.add_argument('--disc_lr', type=float, default=1e-4, help='Learning rate for the Discriminator')
     parser.add_argument('--num_workers', type=int, default=12, help='Number of workers to use')
-    parser.add_argument('--shuffle', type=bool, default=True, help='Number of workers to use')
-    parser.add_argument('--pin_memory', type=bool, default=True, help='Number of workers to use')
-    parser.add_argument('--persistent_workers', type=bool, default=True, help='Number of workers to use')
+    parser.add_argument('--shuffle', type=bool, default=True, help='Whether to Shuffle the data')
+    parser.add_argument('--pin_memory', type=bool, default=True, help='Whether to use pin_memory')
+    parser.add_argument('--persistent_workers', type=bool, default=True, help='Whether to keep workers across each epoch')
 
 
     #Inference related Parameters
@@ -562,11 +578,12 @@ def main():
     # Instantiate model
     gen_model = UNet3D().to(device)
     disc_model = Discriminator3D().to(device)
+    
 
     gen_state = None
     disc_state = None
-    gen_epoch = 1
-    disc_epoch = 1
+    gen_epoch = 0
+    disc_epoch = 0
 
     if args.gen_checkpoint == "": #No checkpoint specified, TODO use the latest in the checkpoint folder
         if os.path.exists("gen_check/latest.pth"):
@@ -595,6 +612,22 @@ def main():
     gen_optimizer = torch.optim.Adam(gen_model.parameters(), lr=gen_lr)
     disc_optimizer = torch.optim.Adam(disc_model.parameters(), lr=disc_lr, betas=(0.1, 0.9))
 
+    for g in gen_optimizer.param_groups:
+        g.setdefault('initial_lr', g['lr'])
+
+    for d in disc_optimizer.param_groups:
+        d.setdefault('initial_lr', d['lr'])
+
+
+    sched_G = CosineAnnealingLR(gen_optimizer,
+                                T_max=80,
+                                last_epoch=gen_epoch,
+                                eta_min=1e-6)
+    
+    sched_D = CosineAnnealingLR(disc_optimizer,
+                            T_max=60,
+                            last_epoch=disc_epoch,
+                            eta_min=1e-6)
 
     
     if gen_state and args.train != "": #If we loaded checkpoint and are training, load any momentum from the optimizer
@@ -619,14 +652,18 @@ def main():
     name = "./outputs/10_24Simulation"
     id = "000"
 
+    if True:
+        runAccuracyTest(gen_model, device)
+        return
 
-    for i in range(epochs):
+
+    for i in range(1, epochs):
         printAndLog("Starting Epoch " + str(gen_epoch + i) + " for the generator.")
         printAndLog("Starting Epoch " + str(disc_epoch + i) + " for the discriminator.")
 
 
         if runMode == TRAINING:
-            train(gen_model, disc_model, loader, gen_optimizer, disc_optimizer, gen_criterion, disc_criterion, device)
+            train(gen_model, disc_model, loader, gen_optimizer, disc_optimizer, gen_criterion, disc_criterion, device, i)
                         # Save weights for later use
             torch.save({
                 'epoch': gen_epoch + i,
@@ -641,6 +678,9 @@ def main():
             }, "gen_check/latest.pth")
 
             printAndLog("Saved generator checkpoint at " + os.path.abspath("gen_check/unet3d_vae_checkpoint" + str(gen_epoch+i) + ".pth"))
+
+            sched_D.step()
+            sched_G.step()
 
             torch.save({
                 'epoch': disc_epoch + i,
