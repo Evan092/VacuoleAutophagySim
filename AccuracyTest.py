@@ -61,9 +61,9 @@ def runAccuracyTest(model, device):
         for i in range(1, 6):
             out_dir = run_dir / f"outputs_{i:02d}"
             for step in range(100):
-                arr = parse_voxel_file(out_dir / f"output{step:03d}.piff")
+                arr = parse_voxel_file(out_dir / f"output{step:03d}.piff").unsqueeze(0)
                 # shape: (1, C, D, H, W)
-                inp_cache[step].append(torch.from_numpy(arr).unsqueeze(0))
+                inp_cache[step].append(arr)
 
         # 3) For each step, batch the 5 inputs into one forward pass
         for step in tqdm(range(100), desc=f"{run_dir.name} steps", leave=False):

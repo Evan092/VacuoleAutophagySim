@@ -16,7 +16,14 @@ class VoxelDataset(Dataset):
         self.paths = [
             os.path.join(folder, d)
             for d in os.listdir(folder)
-            if os.path.isdir(os.path.join(folder, d))
+            if (os.path.isdir(os.path.join(folder, d)) 
+                and os.path.isdir(os.path.join(folder, d, "outputs_01"))
+                and os.path.isdir(os.path.join(folder, d, "outputs_02"))
+                and os.path.isdir(os.path.join(folder, d, "outputs_03"))
+                and os.path.isdir(os.path.join(folder, d, "outputs_04"))
+                and os.path.isdir(os.path.join(folder, d, "outputs_05"))
+                and os.path.isfile(os.path.join(folder, d, "outputs_05", "output300.piff"))
+                and not str(d).lower().endswith(".bat"))
         ]
         self.transform = transform
 
@@ -31,28 +38,34 @@ class VoxelDataset(Dataset):
 
 
         output = f"outputs_{outputNumber:02d}"
-        inputVol = parse_voxel_file(self.paths[idx] + "\\" + output + f"\\output{startStep:03d}.piff")
-        inputTensor = torch.from_numpy(inputVol) #.unsqueeze(0)  # shape [1, D, H, W]
+
+        inputTensor = parse_voxel_file(self.paths[idx] + "\\" + output + f"\\output{startStep:03d}.piff")
+
+        gt_instances = inputTensor.clone().detach()
+        # channels: 0=medium (ignore), 1=body, 2=wall
+        #for ch in [1, 2]:
+            # grab all the IDs in this channel (background is encoded as 0)
+            #ids = np.unique(inputTensor[ch])
+            #ids = ids[ids != 0]   # drop the 0 background
+            #for id_ in ids:
+                # make a boolean mask for that specific cell (or wall)
+                #mask = (inputTensor[ch] == id_)
+                #gt_instances[(ch, id_)] = mask
+
+        #IDTensor = inputTensor.clone().detach()
+
+        #inputTensor = torch.from_numpy(inputVol) #.unsqueeze(0)  # shape [1, D, H, W]
         if self.transform:
             inputTensor = self.transform(inputTensor)
 
-        IDVol = parse_voxel_file(self.paths[idx] + "\\" + output + f"\\output{startStep:03d}.piff")
-        IDTensor = torch.from_numpy(IDVol) #.unsqueeze(0)  # shape [1, D, H, W]
-
-        gt_instances = {}
-        # channels: 0=medium (ignore), 1=body, 2=wall
-        for ch in [1, 2]:
-            # grab all the IDs in this channel (background is encoded as 0)
-            ids = np.unique(IDTensor[ch])
-            ids = ids[ids != 0]   # drop the 0 background
-            for id_ in ids:
-                # make a boolean mask for that specific cell (or wall)
-                mask = (IDTensor[ch] == id_)
-                gt_instances[(ch, id_)] = mask
+        #IDTensor = parse_voxel_file(self.paths[idx] + "\\" + output + f"\\output{startStep:03d}.piff")
+        #IDTensor = torch.from_numpy(IDVol) #.unsqueeze(0)  # shape [1, D, H, W]
 
 
-        outputVol = parse_voxel_file(self.paths[idx] + "\\" + output + f"\\output{(startStep+nSteps):03d}.piff")
-        targetTensor = torch.from_numpy(outputVol)#.unsqueeze(0)  # shape [1, D, H, W]
+
+
+        targetTensor = parse_voxel_file(self.paths[idx] + "\\" + output + f"\\output{(startStep+nSteps):03d}.piff")
+        #targetTensor = torch.from_numpy(outputVol)#.unsqueeze(0)  # shape [1, D, H, W]
         if self.transform:
             targetTensor = self.transform(targetTensor)
 

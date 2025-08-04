@@ -85,17 +85,18 @@ class GenUp(nn.Module):
         return self.conv(x)
 
 class UNet3D(nn.Module):
-    def __init__(self, in_channels=7, out_classes=3, features=[32, 64, 128, 256, 512]):
+    def __init__(self, in_channels=6, out_classes=2, features=[16, 32, 64, 128, 256]):
         super().__init__()
 
         self.noise_proj = nn.Sequential(
-            nn.ConvTranspose3d(noise_dim, 3*2, kernel_size=4, stride=4),      # 1→4
-            #nn.BatchNorm3d(3*2),
-            nn.GroupNorm(num_groups=6, num_channels=3*2),
+            # 1→4
+            nn.ConvTranspose3d(noise_dim, 8, kernel_size=4, stride=4),
+            nn.GroupNorm(num_groups=8, num_channels=8),
             nn.ReLU(inplace=False),
-            nn.ConvTranspose3d(3*2, 3, kernel_size=33, stride=33),# 4→136
-            #nn.BatchNorm3d(3),
-            nn.GroupNorm(num_groups=3, num_channels=3),
+
+            # 4→200  (3*50 + 50 = 200)
+            nn.ConvTranspose3d(8, 2, kernel_size=50, stride=50),
+            nn.GroupNorm(num_groups=2, num_channels=2),
             nn.ReLU(inplace=False),
         )
 
@@ -130,9 +131,9 @@ class UNet3D(nn.Module):
 
         z_vol = z.view(B, noise_dim, 1, 1, 1)
         z_flat = self.noise_proj(z_vol)              # [B, project_to_ch * 64 * 64 * 64]
-        z_final = z_flat.view(B, 3, D, H, W)
+        z_final = z_flat.view(B, 2, D, H, W)
 
-        step_channel = torch.full((B, 1, 132,132,132), float(steps), device=x.device)
+        step_channel = torch.full((B, 1, 200,200,200), float(steps), device=x.device)
         
         x_with_noise = torch.cat([x, z_final, step_channel], dim=1)
         
@@ -147,6 +148,8 @@ class UNet3D(nn.Module):
         x4 = self.convD4(x4)
         x4 = self.relu(x4)
 
+        x4 = self.attention(x4)
+        x4 = self.attention(x4)
         x4 = self.attention(x4)
 
         x  = self.up3(x4, x3)   # → [B, f2, D/4, H/4, W/4]

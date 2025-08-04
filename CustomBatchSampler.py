@@ -5,8 +5,9 @@ class CustomBatchSampler(Sampler):
     def __init__(self, dataset, batch_size, shuffle):
         self.dataset     = dataset
         self.batch_size  = batch_size
-        self.maxSteps = 50
-        self.threshold   = len(dataset) - self.maxSteps  # i.e. 80 if total is 100
+        self.frequency = 50
+        self.maxSteps = 6
+        self.threshold   = len(dataset)  # i.e. 80 if total is 100
         self.shuffle = shuffle
 
     def __iter__(self):
@@ -17,20 +18,17 @@ class CustomBatchSampler(Sampler):
 
         for i in range(0, len(all_idxs), self.batch_size):
             batch_idxs = all_idxs[i:i + self.batch_size]
-            nSteps = random.randint(1, self.maxSteps)  # fixed horizon per batch
+            nSteps = random.randint(1, self.maxSteps)*self.frequency  # fixed horizon per batch
 
             batch_keys = []
             for idx in batch_idxs:
-                idx0 = idx - self.maxSteps if idx >= self.threshold else idx
 
                 outputNumber = random.randint(1, 5)
 
-                startStep = random.randint(1, 98)
-
-                startStep = min(startStep,99-nSteps)
+                startStep = 0
 
 
-                batch_keys.append((idx0, outputNumber, startStep, nSteps))
+                batch_keys.append((idx, outputNumber, startStep, nSteps))
             yield batch_keys
 
     def __len__(self):
