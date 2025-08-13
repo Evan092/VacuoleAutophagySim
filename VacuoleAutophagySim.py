@@ -32,13 +32,23 @@ from VoxelDataset import VoxelDataset
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from scipy.ndimage import maximum_filter
+import datetime
+import numpy as np
+import torch
+import torch.nn.functional as F
+from scipy import sparse
+from scipy.optimize import linear_sum_assignment
+from scipy.ndimage import distance_transform_edt
+from skimage.segmentation import watershed
+from skimage.feature import peak_local_max
+from skimage.measure import label
+
+import torch
+import torch.nn.functional as F
 
 def set_requires_grad(model, req_grad):
     for p in model.parameters():
         p.requires_grad = req_grad
-
-import torch
-import torch.nn.functional as F
 
 def gaussian_kernel3d(channels, kernel_size=5, sigma=1.0, device='cuda'):
     # build a separable 1D Gaussian, then outer‐product into 3D
@@ -50,10 +60,17 @@ def gaussian_kernel3d(channels, kernel_size=5, sigma=1.0, device='cuda'):
     return g3d
 
 def blur_targets(targets, kernel_size=5, sigma=1.0):
+
+
+
     """
     targets:  Tensor of shape (B, C, D, H, W) with 0/1 values
     returns:  blurred float Tensor same shape
     """
+
+    if sigma == 0 or kernel_size <= 1:
+        return targets
+
     B,C,D,H,W = targets.shape
     kernel = gaussian_kernel3d(C, kernel_size, sigma, device=targets.device)
     # pad so output is same size
@@ -107,11 +124,11 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
         gen_optimizer.zero_grad()
         with autocast():
             gen_outputs = gen_model(volumes, z, steps[0].item())
-
-            gen_loss = gen_criterion(gen_outputs, targets)
+            
+            gen_loss = gen_criterion(gen_outputs, torch.argmax(targets, dim=1))
         
             disc_optimizer.zero_grad()
-            blurred_targets = blur_targets(targets, kernel_size=3, sigma=0.5)
+            blurred_targets = blur_targets(targets, kernel_size=3, sigma=0.2)
             disc_outputs = disc_model(blurred_targets)
 
             real_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.9)) #0.9?
@@ -176,7 +193,7 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
                 skipThisDiscBackProp = False
                 skipNextDiscBackProp = False
             elif ((real_loss + fake_loss).item() /2) < 0.5:
-                #skipNextDiscBackProp = True
+                skipNextDiscBackProp = True
                 print("(real_loss + fake_loss) /2) < 0.5")
             else:
                 skipNextDiscBackProp = False
@@ -196,7 +213,7 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
     printAndLog("Epoch_fake:" + str(  running_fake_loss/total) + "\n")
     printAndLog("Epoch_adv:" + str(  running_adv_loss/total) + "\n")
     avg_D_Loss  = ((running_real_loss + running_fake_loss)/total)/2 
-    d_loss_diff = (abs(running_real_loss - running_fake_loss))/total/2 
+    d_loss_diff = (abs(running_real_loss - running_fake_loss))/total
     printAndLog("avg_D_Loss:" + str(avg_D_Loss) + "\n")
     printAndLog("d_loss_diff:" + str(d_loss_diff) + "\n")
     printAndLog("------------------------------------------" + "\n")
@@ -262,7 +279,7 @@ def evaluate(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, g
             pred_label = gen_outputs.detach().cpu().numpy().argmax(axis=0)  # [Z,Y,X]
 
             all_matches = []
-            for ch in [1, 2]:
+            for ch in [0,1]:
                 # 2) Extract predicted instances for this channel
                 pred_instances = {}
                 binary, comp_map = (pred_label == ch), None
@@ -317,17 +334,6 @@ def evaluate(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, g
     print("Current:", running_loss/total)
 
     return running_loss / total
-
-import datetime
-import numpy as np
-import torch
-import torch.nn.functional as F
-from scipy import sparse
-from scipy.optimize import linear_sum_assignment
-from scipy.ndimage import distance_transform_edt
-from skimage.segmentation import watershed
-from skimage.feature import peak_local_max
-from skimage.measure import label
 
 def runinference(gen_model, volumes, gt_instances, steps, device):
     """
@@ -865,7 +871,7 @@ def main():
 
 
     #Assign the criterion for calculating loss
-    gen_criterion = nn.BCEWithLogitsLoss()
+    gen_criterion = nn.CrossEntropyLoss()
     disc_criterion = nn.BCEWithLogitsLoss()
 
     #Set the runMode variable based on the arguments when launching

@@ -85,7 +85,7 @@ class GenUp(nn.Module):
         return self.conv(x)
 
 class UNet3D(nn.Module):
-    def __init__(self, in_channels=6, out_classes=2, features=[16, 32, 64, 128, 256]):
+    def __init__(self, in_channels=6, out_classes=3, features=[16, 32, 64, 128, 256]):
         super().__init__()
 
         self.noise_proj = nn.Sequential(

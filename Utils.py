@@ -233,9 +233,10 @@ def parse_voxel_file(path):
         else:
             body_mask = (tensor == 1).float()  # 1s where Body
             wall_mask = (tensor == 2).float()  # 1s where Wall
+            Neither = (tensor == 0).float()
 
             # Stack into 2-channel tensor: [2, D, H, W]
-            tensor = torch.cat([body_mask, wall_mask], dim=0)
+            tensor = torch.cat([body_mask, wall_mask,Neither], dim=0)
 
             return tensor
     elif delete and os.path.isfile(os.path.join(str(path).removesuffix(".piff") + ".pt")):
@@ -280,7 +281,7 @@ def parse_voxel_file(path):
 
     # Stack into 2-channel tensor: [2, D, H, W]
     tensor = torch.cat([body_mask, wall_mask, Neither], dim=0)
-
+    vol = np.flip(vol, axis=3)
     return tensor
 
 
