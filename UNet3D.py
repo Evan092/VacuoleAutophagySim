@@ -85,7 +85,7 @@ class GenUp(nn.Module):
         return self.conv(x)
 
 class UNet3D(nn.Module):
-    def __init__(self, in_channels=6, out_classes=3, features=[16, 32, 64, 128, 256]):
+    def __init__(self, in_channels=9, out_classes=6, features=[16, 32, 64, 128, 256]):
         super().__init__()
 
         self.noise_proj = nn.Sequential(
@@ -108,7 +108,9 @@ class UNet3D(nn.Module):
         self.down4 = GenDown(features[3], features[4])
 
         #Attention
-        self.attention = SelfAttention3D(features[4])
+        self.attention1 = SelfAttention3D(features[4])
+        self.attention2 = SelfAttention3D(features[4])
+        self.attention3 = SelfAttention3D(features[4])
         # Decoder
         self.up3   = GenUp(features[4], features[3])
         self.up2   = GenUp(features[3], features[2])
@@ -124,17 +126,17 @@ class UNet3D(nn.Module):
         self.convU3 = nn.Conv3d(features[3], features[3], kernel_size=3, padding=1, stride=1)
         self.convU2 = nn.Conv3d(features[2], features[2], kernel_size=3, padding=1, stride=1)
         self.relu = nn.ReLU(inplace=False)
+        self.tanh = nn.Tanh()
+        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x, z, steps):
+    def forward(self, x, steps):
 
         B, _, D, H, W = x.shape
 
-        z_vol = z.view(B, noise_dim, 1, 1, 1)
-        z_flat = self.noise_proj(z_vol)              # [B, project_to_ch * 64 * 64 * 64]
-        z_final = z_flat.view(B, 2, D, H, W)
+        z_final = torch.empty(B, 2, D, H, W, device=x.device, dtype=x.dtype).normal_(0.0, 0.1)
 
         step_channel = torch.full((B, 1, 200,200,200), float(steps), device=x.device)
-        
+
         x_with_noise = torch.cat([x, z_final, step_channel], dim=1)
         
 
@@ -148,9 +150,9 @@ class UNet3D(nn.Module):
         x4 = self.convD4(x4)
         x4 = self.relu(x4)
 
-        x4 = self.attention(x4)
-        x4 = self.attention(x4)
-        x4 = self.attention(x4)
+        x4 = self.attention1(x4)
+        x4 = self.attention2(x4)
+        x4 = self.attention3(x4)
 
         x  = self.up3(x4, x3)   # → [B, f2, D/4, H/4, W/4]
         x = self.convU3(x)
@@ -163,6 +165,10 @@ class UNet3D(nn.Module):
 
         x  = self.up1(x,  x1)   # → [B, f1, D/2, H/2, W/2]
         x  = self.up0(x,  x0)   # → [B, f0, D,   H,   W  ]
-        return self.outc(x)     # → [B, out_classes, D, H, W]
+
+
+        result = self.outc(x)
+
+        return result
 
 
