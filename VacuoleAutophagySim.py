@@ -160,21 +160,25 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
     fake_weight = 1
 
     adv_weight = 0.2
-    gen_prob_weight = 0.4
-    gen_dir_weight = 1
+    gen_prob_weight = 3
+    gen_dir_weight = 5.25
 
     weight_sum = adv_weight + gen_prob_weight + gen_dir_weight
 
-    adv_weight = adv_weight/weight_sum
-    gen_prob_weight = gen_prob_weight/weight_sum
-    gen_dir_weight = gen_dir_weight/weight_sum
+    adv_weight = (adv_weight/weight_sum)*5
+    gen_prob_weight = (gen_prob_weight/weight_sum)*5
+    gen_dir_weight = (gen_dir_weight/weight_sum)*5
 
     total = 0
 
     skipThisGenBackProp = False
     skipThisDiscBackProp = False
 
-    for volumes, targets, steps, path1, path2 in dataloader:
+
+    accum_steps = 4  # simulate batch_size = 4
+    gen_optimizer.zero_grad(set_to_none=True)
+    disc_optimizer.zero_grad(set_to_none=True)
+    for i, (volumes, targets, steps, path1, path2) in enumerate(dataloader, start=1):
         volumes = volumes.to(device)
         targets = targets.to(device)
 
@@ -193,11 +197,7 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
         #z = torch.randn(B, noise_dim, device=device) * 0.1
 
         #Generate our predicted values
-        gen_optimizer.zero_grad()
         #with autocast():
-
-        #if (not voxel_points_to_self(targets[0], 100,100,100)):
-            #raise Exception
         
         B, _, D, H, W = volumes.shape
 
@@ -243,7 +243,7 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
 
 
         # Normalize the direction channels
-        p = torch.tanh(directions.clone())   # bound raw logits
+        p = directions.clone()   # bound raw logits
         g = target_directions.detach()       # no grad through targets
 
         # Compute norms safely
@@ -272,16 +272,14 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
         #gen_dist_loss = gen_dist_criterion(gen_outputs[:, -1:, ...], targets[:, -1:, ...])
 
 
-        gen_prob_loss = F.cross_entropy(probabilities, target_probabilities)
+        gen_prob_loss = F.cross_entropy(probabilities, target_probabilities, label_smoothing=0.075)
         
-    
+
         #target_idx = target_probabilities.argmax(dim=1).long()
         #gen_prob_loss = F.cross_entropy(probabilities, target_idx)
 
         target_probabilities = blur_targets(targets[:, 3:, ...], kernel_size=3, sigma=sigma_sched.value)
         
-        
-        disc_optimizer.zero_grad()
         
         blurred_targets = targets #blur_targets(targets, kernel_size=3, sigma=0.2)
         
@@ -312,39 +310,41 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
 
         fake_output = gen_outputs
 
-
-        if not skipThisDiscBackProp:
-            print("Doing disc backprop")
-            set_requires_grad(gen_model, False)
-            assert torch.isfinite(fake_loss).all()
-            assert torch.isfinite(real_loss).all()
-            #scaler.scale((fake_loss * fake_weight) + (real_loss*real_weight)).backward()
-            #scaler.step(disc_optimizer)
-            #scaler.update()
-            disc_optimizer.zero_grad()
-            ((fake_loss * fake_weight) + (real_loss * real_weight)).backward()
+        set_requires_grad(gen_model, False)
+        assert torch.isfinite(fake_loss).all()
+        assert torch.isfinite(real_loss).all()
+        #disc_optimizer.zero_grad()
+        #scaler.scale((fake_loss * fake_weight) + (real_loss*real_weight)).backward()
+        #scaler.step(disc_optimizer)
+        #scaler.update()
+        (((fake_loss * fake_weight) + (real_loss * real_weight))/accum_steps).backward()
+        if i % accum_steps == 0 or i == len(dataloader):
             disc_optimizer.step()
-            set_requires_grad(gen_model, True)
-        else:
-            print("Skipping disc backprop")
+            print("Stepping Disc")
+            disc_optimizer.zero_grad(set_to_none=True)
+
+        #disc_optimizer.step()
+        set_requires_grad(gen_model, True)
 
         disc_outputs2 = disc_model(fake_output)
 
         adv_loss = disc_criterion(disc_outputs2, torch.ones_like(disc_outputs2))
 
-        #finalize generated loss
-        if not skipThisGenBackProp:
-            set_requires_grad(disc_model, False)
-            assert torch.isfinite(gen_dir_loss).all()
-            assert torch.isfinite(gen_prob_loss).all()
-            assert torch.isfinite(adv_loss).all()
-            #scaler.scale((gen_dir_loss*gen_dir_weight) + (gen_prob_loss*gen_prob_weight) + (adv_loss*adv_weight)).backward()
-            #scaler.step(gen_optimizer)
-            #scaler.update()
-            gen_optimizer.zero_grad()
-            ((gen_dir_loss*gen_dir_weight) + (gen_prob_loss*gen_prob_weight) + (adv_loss*adv_weight)).backward()
+        set_requires_grad(disc_model, False)
+        assert torch.isfinite(gen_dir_loss).all()
+        assert torch.isfinite(gen_prob_loss).all()
+        assert torch.isfinite(adv_loss).all()
+        #gen_optimizer.zero_grad()
+        #scaler.scale((gen_dir_loss*gen_dir_weight) + (gen_prob_loss*gen_prob_weight) + (adv_loss*adv_weight)).backward()
+        #scaler.step(gen_optimizer)
+        #scaler.update()
+        (((gen_dir_loss*gen_dir_weight) + (gen_prob_loss*gen_prob_weight) + (adv_loss*adv_weight))/accum_steps).backward()
+        if i % accum_steps == 0 or i == len(dataloader):
+            print("Stepping Gen")
             gen_optimizer.step()
-            set_requires_grad(disc_model, True)
+            gen_optimizer.zero_grad(set_to_none=True)
+        #gen_optimizer.step()
+        set_requires_grad(disc_model, True)
 
 
         assert_all_params_finite(gen_model)
@@ -365,23 +365,6 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
         running_adv_loss += (adv_loss.item()) * volumes.size(0)
         total += volumes.size(0)
 
-        if skipThisDiscBackProp:
-            skipThisDiscBackProp = False
-            skipNextDiscBackProp = False
-        elif ((real_loss + fake_loss).item() /2) < 0.5:
-            #skipNextDiscBackProp = True
-            print("(real_loss + fake_loss) /2) < 0.5")
-        else:
-            skipNextDiscBackProp = False
-
-        if skipThisGenBackProp:
-            skipThisGenBackProp = False
-            skipNextGenBackProp = False
-        elif (fake_loss.item() /2) > 0.8:
-            #skipNextGenBackProp = True
-            print("fake_loss > 0.8")
-        else:
-            skipNextGenBackProp = False
 
     printAndLog("\n")
     printAndLog("Epoch_gen_prob:" + str( running_gen_prob_loss/total) + "[" + str( running_gen_prob_loss*gen_prob_weight/total) + "]" + "\n")
@@ -991,13 +974,17 @@ def add_weight_decay(module, wd, skip_norm=True):
 
 sigma_sched = None
 
+
+
+
+
 def main():
     global sigma_sched
 
     parser = argparse.ArgumentParser()
     #Training related parameters
     parser.add_argument('--train', type=str, default="D:\\runs\\runs", help='Path to dataset') #
-    parser.add_argument('--batchSize', type=int, default=2, help='Batch size for training')
+    parser.add_argument('--batchSize', type=int, default=1, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of Epochs to run')
     parser.add_argument('--gen_lr', type=float, default=4e-4, help='Learning rate for the Generator')
     parser.add_argument('--disc_lr', type=float, default=1e-4, help='Learning rate for the Discriminator')
@@ -1075,7 +1062,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
         batch_sampler=customBatchSampler,
-        persistent_workers=args.persistent_workers
+        persistent_workers=args.persistent_workers,
         
     )
 
@@ -1105,12 +1092,12 @@ def main():
 
     if gen_state: #We loaded a checkpoint. (We wouldn't if it was the first run)
         gen_epoch = gen_state['epoch'] #Load the checkpoint the generator was on
-        gen_model.load_state_dict(gen_state['model_state_dict']) #Load the weights and biases
+        gen_model.load_state_dict(gen_state['model_state_dict'], strict=False) #Load the weights and biases
 
     if disc_state: #We loaded a checkpoint. (We wouldn't if it was the first run)
         disc_epoch = disc_state['epoch'] #Load the checkpoint the discriminator was on
         
-        disc_model.load_state_dict(disc_state['model_state_dict']) #Load the weights and biases
+        disc_model.load_state_dict(disc_state['model_state_dict'], strict=False) #Load the weights and biases
 
 
     gen_param_groups  = add_weight_decay(gen_model,  wd=3e-4)
@@ -1144,12 +1131,12 @@ def main():
         if isinstance(m, ScheduledDropout):
             m.setEpoch(disc_epoch)
 
-    
-    if gen_state and args.train != "": #If we loaded checkpoint and are training, load any momentum from the optimizer
-            gen_optimizer.load_state_dict(gen_state['optimizer_state_dict'])
+    if False:
+        if gen_state and args.train != "": #If we loaded checkpoint and are training, load any momentum from the optimizer
+                gen_optimizer.load_state_dict(gen_state['optimizer_state_dict'])
 
-    if disc_state and args.train != "": #If we loaded checkpoint and are training, load any momentum from the optimizer
-            disc_optimizer.load_state_dict(disc_state['optimizer_state_dict'])
+        if disc_state and args.train != "": #If we loaded checkpoint and are training, load any momentum from the optimizer
+                disc_optimizer.load_state_dict(disc_state['optimizer_state_dict'])
 
 
     #Assign the criterion for calculating loss

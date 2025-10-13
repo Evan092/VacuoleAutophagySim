@@ -84,8 +84,37 @@ class GenUp(nn.Module):
         x = torch.cat([skip, x], dim=1)
         return self.conv(x)
 
+
+class ProbHead(nn.Module):
+    def __init__(self, features, out_classes):
+        super().__init__()
+        self.prob_head = nn.Sequential(
+            nn.Conv3d(features[0], features[1], 1, bias=False),             # 16 → 32 (cheap)
+            nn.GroupNorm(4, features[1]), nn.LeakyReLU(inplace=True),
+            nn.Conv3d(features[1], features[2], 3, padding=1, bias=False),  # 32 → 64
+            nn.GroupNorm(8, features[2]), nn.LeakyReLU(inplace=True),
+            nn.Dropout3d(0.1),
+            nn.Conv3d(features[2], out_classes, 1, bias=True)
+        )             # your conv/gn/relu/... stack
+
+    def forward(self, x):
+        # upstream is in mixed precision; force FP32 math here
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            return self.prob_head(x.float()) # cast activations to FP32 for this block
+        
+
+class DirHead(nn.Module):
+    def __init__(self, features, out_classes):
+        super().__init__()
+        self.outc  = nn.Conv3d(features, out_classes, kernel_size=1)        # your conv/gn/relu/... stack
+
+    def forward(self, x):
+        # upstream is in mixed precision; force FP32 math here
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            return self.outc(x.float()) # cast activations to FP32 for this block
+
 class UNet3D(nn.Module):
-    def __init__(self, in_channels=9, out_classes=6, features=[16, 32, 64, 128, 256]):
+    def __init__(self, in_channels=9, out_classes=3, features=[16, 32, 64, 128, 256]):
         super().__init__()
 
         self.noise_proj = nn.Sequential(
@@ -117,7 +146,7 @@ class UNet3D(nn.Module):
         self.up1   = GenUp(features[2], features[1])
         self.up0   = GenUp(features[1], features[0])
         # Final 1×1×1 conv to map to desired classes
-        self.outc  = nn.Conv3d(features[0], out_classes, kernel_size=1)
+        self.outc  = DirHead(features[0], out_classes)
 
 
         self.convD3 = nn.Conv3d(features[3], features[3], kernel_size=3, padding=1, stride=1)
@@ -128,16 +157,22 @@ class UNet3D(nn.Module):
         self.relu = nn.ReLU(inplace=False)
         self.tanh = nn.Tanh()
         self.sigmoid = nn.Sigmoid()
+        self.prob_head = ProbHead(features, out_classes)
 
     def forward(self, x, steps):
+
+        #x = a[:, :3, ...] #vectors
+        #y = a[:, 3:, ...] #probabilities
 
         B, _, D, H, W = x.shape
 
         z_final = torch.empty(B, 2, D, H, W, device=x.device, dtype=x.dtype).normal_(0.0, 0.1)
 
-        step_channel = torch.full((B, 1, 200,200,200), float(steps), device=x.device)
+
+        step_channel = torch.full((B, 1, D, H, W), float(steps), device=x.device, dtype=x.dtype)
 
         x_with_noise = torch.cat([x, z_final, step_channel], dim=1)
+        #y_with_noise = torch.cat([y, z_final, step_channel], dim=1)
         
 
         x0 = self.inc(x_with_noise)        # → [B, f0, D, H, W]
@@ -158,7 +193,7 @@ class UNet3D(nn.Module):
         x = self.convU3(x)
         x = self.relu(x)
 
-        x  = self.up2(x3, x2)   # → [B, f2, D/4, H/4, W/4]
+        x  = self.up2(x, x2)   # → [B, f2, D/4, H/4, W/4]
 
         x = self.convU2(x)
         x = self.relu(x)
@@ -166,9 +201,8 @@ class UNet3D(nn.Module):
         x  = self.up1(x,  x1)   # → [B, f1, D/2, H/2, W/2]
         x  = self.up0(x,  x0)   # → [B, f0, D,   H,   W  ]
 
+        #result = self.outc(x)
 
-        result = self.outc(x)
-
-        return result
+        return torch.cat([self.tanh(self.outc(x)), self.prob_head(x)], dim=1)
 
 
