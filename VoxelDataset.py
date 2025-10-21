@@ -66,15 +66,43 @@ class VoxelDataset(Dataset):
 
 
 
+        outputNumber=1
+        output = f"outputs_{outputNumber:02d}"
+        targetTensor1,centers1  = parse_voxel_file_for_distance(self.paths[idx] + "\\" + output + f"\\output{(startStep+nSteps):03d}.piff")
+        targetTensor1 = targetTensor1.squeeze(0)
 
-        targetTensor,_  = parse_voxel_file_for_distance(self.paths[idx] + "\\" + output + f"\\output{(startStep+nSteps):03d}.piff")
-        targetTensor = targetTensor.squeeze(0)
+        outputNumber=2
+        output = f"outputs_{outputNumber:02d}"
+        targetTensor2,centers2  = parse_voxel_file_for_distance(self.paths[idx] + "\\" + output + f"\\output{(startStep+nSteps):03d}.piff")
+        targetTensor2 = targetTensor2.squeeze(0)
+
+        outputNumber=3
+        output = f"outputs_{outputNumber:02d}"
+        targetTensor3,centers3  = parse_voxel_file_for_distance(self.paths[idx] + "\\" + output + f"\\output{(startStep+nSteps):03d}.piff")
+        targetTensor3 = targetTensor3.squeeze(0)
+
+        outputNumber=4
+        output = f"outputs_{outputNumber:02d}"
+        targetTensor4,centers4  = parse_voxel_file_for_distance(self.paths[idx] + "\\" + output + f"\\output{(startStep+nSteps):03d}.piff")
+        targetTensor4 = targetTensor4.squeeze(0)
+
+        outputNumber=5
+        output = f"outputs_{outputNumber:02d}"
+        targetTensor5,centers5  = parse_voxel_file_for_distance(self.paths[idx] + "\\" + output + f"\\output{(startStep+nSteps):03d}.piff")
+        targetTensor5 = targetTensor5.squeeze(0)
+
+
+
 
         #if (not voxel_points_to_self(targetTensor,100,100,100)):
             #raise Exception
 
         if self.transform:
-            targetTensor = self.transform(targetTensor)
+            targetTensor1 = self.transform(targetTensor1)
+            targetTensor2 = self.transform(targetTensor2)
+            targetTensor3 = self.transform(targetTensor3)
+            targetTensor4 = self.transform(targetTensor4)
+            targetTensor5 = self.transform(targetTensor5)
 
         zFlip = random.randint(0,1)
         xFlip = random.randint(0,1)
@@ -84,18 +112,34 @@ class VoxelDataset(Dataset):
 
         if zFlip == 1:
             inputTensor[0] = inputTensor[0]*-1
-            targetTensor[0] = targetTensor[0]*-1
+            targetTensor1[0] = targetTensor1[0]*-1
+            targetTensor2[0] = targetTensor2[0]*-1
+            targetTensor3[0] = targetTensor3[0]*-1
+            targetTensor4[0] = targetTensor4[0]*-1
+            targetTensor5[0] = targetTensor5[0]*-1
             flips.append(1)
         if yFlip == 1:
             inputTensor[1] = inputTensor[1]*-1
-            targetTensor[1] = targetTensor[1]*-1
+            targetTensor1[1] = targetTensor1[1]*-1
+            targetTensor2[1] = targetTensor2[1]*-1
+            targetTensor3[1] = targetTensor3[1]*-1
+            targetTensor4[1] = targetTensor4[1]*-1
+            targetTensor5[1] = targetTensor5[1]*-1
             flips.append(2)
         if xFlip == 1:
             inputTensor[2] = inputTensor[2]*-1
-            targetTensor[2] = targetTensor[2]*-1
+            targetTensor1[2] = targetTensor1[2]*-1
+            targetTensor2[2] = targetTensor2[2]*-1
+            targetTensor3[2] = targetTensor3[2]*-1
+            targetTensor4[2] = targetTensor4[2]*-1
+            targetTensor5[2] = targetTensor5[2]*-1
             flips.append(3)
 
         inputTensor = torch.flip(inputTensor, dims=flips)
-        targetTensor = torch.flip(targetTensor, dims=flips)
+        targetTensor1 = torch.flip(targetTensor1, dims=flips)
+        targetTensor2 = torch.flip(targetTensor2, dims=flips)
+        targetTensor3 = torch.flip(targetTensor3, dims=flips)
+        targetTensor4 = torch.flip(targetTensor4, dims=flips)
+        targetTensor5 = torch.flip(targetTensor5, dims=flips)
 
-        return inputTensor.clone(), targetTensor.clone(), nSteps, (self.paths[idx] + "\\" + output + f"\\output{startStep:03d}.piff"),(self.paths[idx] + "\\" + output + f"\\output{(startStep+nSteps):03d}.piff")
+        return inputTensor.clone(), (targetTensor1.clone(),centers1),(targetTensor2.clone(),centers2),(targetTensor3.clone(),centers3),(targetTensor4.clone(),centers4),(targetTensor5.clone(),centers5), nSteps, (self.paths[idx] + "\\" + output + f"\\output{startStep:03d}.piff")

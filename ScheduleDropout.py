@@ -9,7 +9,7 @@ class ScheduledDropout(nn.Module):
         self.p_end   = p_end
         self.T_max   = T_max
         self.mode    = mode
-        self.epoch   = epoch
+        self.epoch   = min(epoch + 1, T_max)
         self.p = 0
 
     @property
@@ -25,7 +25,11 @@ class ScheduledDropout(nn.Module):
         return nn.functional.dropout(x, p=self.p, training=self.training)
 
     def setEpoch(self, epoch):
-        self.epoch = epoch
+        self.epoch = min(epoch + 1, self.T_max)
+        if self.mode == 'linear':
+            self.p = self.p_start - (self.p_start - self.p_end) * (self.epoch / self.T_max)
+        else:  # cosine
+            self.p = self.p_end + 0.5 * (self.p_start - self.p_end) * (1 + math.cos(math.pi * self.epoch / self.T_max))
 
     def step(self):
         """Call once per epoch."""

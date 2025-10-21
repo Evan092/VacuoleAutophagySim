@@ -6,7 +6,7 @@ class ScheduledSigma:
         self.sigma_end   = sigma_end
         self.T_max       = T_max
         self.mode        = mode
-        self.epoch       = epoch
+        self.epoch       = min(epoch + 1, T_max)
 
     @property
     def value(self):

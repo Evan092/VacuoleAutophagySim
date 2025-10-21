@@ -1,8 +1,10 @@
 import argparse
 import datetime
 from functools import partial
+import gc
 import os
 import random
+from matplotlib import pyplot as plt
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import time
 import numpy as np
@@ -27,8 +29,7 @@ from Discrimnator3D import Discriminator3D
 from UNet3D import UNet3D
 from CustomBatchSampler import CustomBatchSampler
 from AccuracyTest import runAccuracyTest
-from Utils import parse_voxel_file, parse_voxel_file_for_ID_matching, parse_voxel_file_for_distance
-from Utils import get_voxel_center, voxel_points_to_self, quiver_slice_zyx
+from Utils import *
 from ScheduleDropout import ScheduledDropout
 from SigmaScheduler import ScheduledSigma
 from VoxelDataset import VoxelDataset
@@ -81,7 +82,7 @@ def blur_targets(targets, kernel_size=5, sigma=1.0):
     pad = kernel_size // 2
     return F.conv3d(targets, kernel, padding=pad, groups=C)
 
-def plotTensor(tensor, batchIdx=0):
+def plotTensor(tensor, batchIdx=0, i=97, savePath=""):
     probs = tensor[:, 3:, ...]                 # [B, K, D, H, W] (or [B, K, H, W])
 
     idx = probs.argmax(dim=1, keepdim=True)         # [B, 1, ...]
@@ -91,7 +92,7 @@ def plotTensor(tensor, batchIdx=0):
 
     restored = final.repeat(1, 3, 1, 1, 1)
 
-    quiver_slice_zyx((tensor[:, :3, ...]*restored)[batchIdx],  axis='y', index=96, stride=1)
+    quiver_slice_zyx((tensor[:, :3, ...]*restored)[batchIdx],  axis='y', index=i, stride=1, savePath=savePath)
 
 
 import torch
@@ -136,6 +137,8 @@ def assert_all_params_finite(model):
 
 
 
+
+
 # ----------------------------------------
 # 4) Main Script
 # ----------------------------------------
@@ -144,7 +147,521 @@ skipNextDiscBackProp = False
 skipNextGenBackProp = False
 scaler = GradScaler()
 
-def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_dist_criterion, gen_dir_criterion, disc_criterion, device, epochNumber):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn.functional as F
+
+# --------- small helpers (no loss changes) ---------
+
+def _normalize_dirs_nograd(t: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    # NO GRAD normalizer for directions (for cost-building & D step)
+    with torch.no_grad():
+        out = t.clone()
+        d = out[:, :3, ...]
+        n = torch.linalg.norm(d, dim=1, keepdim=True).clamp_min(eps)
+        out[:, :3, ...] = d / n
+    return out
+
+def _normalize_dirs_grad(t: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    # GRAD-PRESERVING normalizer for directions (for G step)
+    d = t[:, :3, ...]
+    n = torch.linalg.norm(d, dim=1, keepdim=True).clamp_min(eps)
+    d_norm = d / n
+    return torch.cat([d_norm, t[:, 3:, ...]], dim=1)
+
+def _cos_dir_loss_per_sample(pred_dirs, tgt_dirs, valid, weight, eps=1e-8):
+    # your cosine-style gen_dir_loss but returns [B] (per-sample), not a scalar yet
+    cos_sim   = (pred_dirs * tgt_dirs).sum(dim=1)            # [B,D,H,W]
+    per_voxel = 1.0 - cos_sim
+    num = (per_voxel * valid * weight).sum(dim=(1,2,3))               # [B]
+    den = valid.sum(dim=(1,2,3)).clamp_min(1)                # [B]
+    return num / den                                         # [B]
+
+def _greedy_match(cost: torch.Tensor) -> torch.Tensor:
+    """
+    cost: [B,S,5] DETACHED. Returns a bool mask [B,S,5] selecting min(S,5) pairs
+    per batch item (one-to-one greedy).
+    """
+    assert cost.ndim == 3
+    B, S, K = cost.shape
+    m = min(S, K)
+    work = cost.clone()
+    mask = torch.zeros_like(work, dtype=torch.bool)
+    for _ in range(m):
+        _, flat = work.view(B, -1).min(dim=1)  # [B]
+        s = flat // K
+        i = flat %  K
+        b = torch.arange(B, device=cost.device)
+        mask[b, s, i] = True
+        work[b, s, :] = float('inf')
+        work[b, :, i] = float('inf')
+    return mask
+
+
+def center_weight_mask(shape=(200,200,200), center=None, sigma=100.0, device='cuda'):
+    D,H,W = shape
+    if center is None:
+        center = (D/2, H/2, W/2)
+    z = torch.arange(D, device=device) - center[0]
+    y = torch.arange(H, device=device) - center[1]
+    x = torch.arange(W, device=device) - center[2]
+    zz,yy,xx = torch.meshgrid(z,y,x, indexing='ij')
+    r2 = zz**2 + yy**2 + xx**2
+    mask = torch.exp(-r2/(2*sigma**2))
+    return mask / mask.max() 
+
+from PIL import Image
+
+def nameTBD(gen_outputs, expectedBodies, savePath):
+    distToCenter = modelFlowToCenter(gen_outputs)
+    coords_idx = displacements_to_coords(distToCenter, round_to_int=True)
+    triplets = coords_idx.permute(1, 2, 3, 0)
+    triplets = triplets[~torch.isnan(triplets[:,:,:,0]) & ~torch.isnan(triplets[:,:,:,1]) & ~torch.isnan(triplets[:,:,:,2])]
+    triplets = triplets.reshape(-1,3)
+
+    unique_triplets, counts = torch.unique(triplets, dim=0, return_counts=True) # how many map to each voxel
+    
+    result = torch.cat([counts.unsqueeze(1), unique_triplets], dim=1)
+    
+    centers = drop_nearby_by_count(result, radius=2.0, minCount=0)
+    idx = torch.argsort(centers[:, 0], descending=True)
+    centers_sorted = centers[idx]
+    centers_sorted = centers_sorted[:expectedBodies, :]
+
+    final_coords = snap_coords_fast(coords_idx, centers_sorted,
+    r_snap=1,          # radius => includes ±3 in each axis
+    r_neighbor=3,      # radius => includes ±3
+    treat_zero_as_bg=True,
+    interpret="radius")
+
+    ids = cluster_ids_from_coords(final_coords)
+    rgb_slice = render_cluster_slice(ids, axis='z', index=100, background='black')
+
+    Image.fromarray(rgb_slice.cpu().numpy()).save(savePath+".png")
+    #plt.imshow(rgb_slice.cpu().numpy())  # rgb_slice is (H,W,3) uint8
+    #plt.axis('off')
+    #plt.show()
+
+
+
+# --------- MEMORY-EFFICIENT TRAIN (loss math unchanged) ---------
+
+def train(gen_model, disc_model, dataloader,
+          gen_optimizer, disc_optimizer,
+          gen_dist_criterion, gen_dir_criterion,   # kept for signature parity
+          disc_criterion, device, epochNumber):
+
+    # externals used in your codebase:
+    # - blur_targets
+    # - set_requires_grad
+    # - ScheduledDropout
+    # - sigma_sched
+    # - printAndLog
+    global sigma_sched
+
+    gen_model.train()
+    disc_model.train()
+
+    # weights exactly as you computed
+    eps = 1e-8
+    real_weight = 1.0
+    fake_weight = 1.0
+    
+    gen_prob_weight = 2
+    gen_dir_weight = 1
+    adv_weight = 3
+
+    # bookkeeping
+    running_loss = 0.0
+    running_gen_prob_loss = 0.0
+    running_gen_dir_loss  = 0.0
+    running_real_loss     = 0.0
+    running_fake_loss     = 0.0
+    running_adv_loss      = 0.0
+    total = 0
+
+    S = 5  # number of generator draws per x (same as your 5 rows)
+
+
+    needToPrint = True
+    for m in disc_model.modules():
+        if isinstance(m, ScheduledDropout):
+            if needToPrint:
+                printAndLog(f"Dropout: {m.value:.4f}")
+                needToPrint=False
+
+    sigma_sched.step()
+    printAndLog(f"New sigma: {sigma_sched.value:.4f}")
+
+    for index, (volumes, (t1,c1),(t2,c2),(t3,c3),(t4,c4),(t5,c5), steps, path1) in enumerate(dataloader):
+        if False:
+
+            folder = "C:\\Users\\evans\\Documents\\Independent Example Tests\\Examples B\\Example" + str(index)
+            os.mkdir(folder)
+            volumes = volumes.to(device, non_blocking=True)
+            gout = gen_model(volumes, steps[0].item())
+            nameTBD(gout, len(c1.squeeze(0))+1, (folder + "\\Trial " + str(1)))
+            del gout
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            gout = gen_model(volumes, steps[0].item())
+            nameTBD(gout, len(c2.squeeze(0))+1, (folder + "\\Trial " + str(2)))
+            del gout
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            gout = gen_model(volumes, steps[0].item())
+            nameTBD(gout, len(c3.squeeze(0))+1, (folder + "\\Trial " + str(3)))
+            del gout
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            gout = gen_model(volumes, steps[0].item())
+            nameTBD(gout, len(c4.squeeze(0))+1, (folder + "\\Trial " + str(4)))
+            del gout
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            gout = gen_model(volumes, steps[0].item())
+            nameTBD(gout, len(c5.squeeze(0))+1, (folder + "\\Trial " + str(5)))
+            del gout
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+
+
+            folder = "C:\\Users\\evans\\Documents\\Independent Example Tests\\Examples A\\Example" + str(index)
+            os.makedirs(folder, exist_ok=False)
+            nameTBD(t1, len(c1.squeeze(0))+1, (folder + "\\Trial " + str(1)))
+            del t1
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            nameTBD(t2, len(c2.squeeze(0))+1, (folder + "\\Trial " + str(2)))
+            del t2
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            nameTBD(t3, len(c3.squeeze(0))+1, (folder + "\\Trial " + str(3)))
+            del t3
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            nameTBD(t4, len(c4.squeeze(0))+1, (folder + "\\Trial " + str(4)))
+            del t4
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            nameTBD(t5, len(c5.squeeze(0))+1, (folder + "\\Trial " + str(5)))
+            del t5
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+            continue
+
+
+
+
+        print(index+1,"/",len(dataloader))
+        volumes = volumes.to(device, non_blocking=True)
+        B = volumes.size(0)
+        targets_list = [t1.to(device, non_blocking=True),
+                        t2.to(device, non_blocking=True),
+                        t3.to(device, non_blocking=True),
+                        t4.to(device, non_blocking=True),
+                        t5.to(device, non_blocking=True)]
+
+        # ===== Prep targets ONCE (no grad), same normalization as your code =====
+        # We create TWO views for each target:
+        # - tn: normalized directions (what your code wrote back in-place)
+        # - tprob_raw: the UN-BLURRED probabilities used by CE BEFORE you blur
+        # - tprob_blur: blurred probabilities used later where you blur in your code
+        T_norm = []
+        T_prob_raw = []
+        T_prob_blur = []
+        T_valid = []
+        with torch.no_grad():
+            for t in targets_list:
+                assert torch.isfinite(t).all()
+                tn = t.clone()
+                g  = tn[:, :3, ...]
+                gn = torch.linalg.norm(g, dim=1, keepdim=True).clamp_min(eps)
+                tn[:, :3, ...] = g / gn  # same as your in-place normalize
+
+                valid = ((tn[:,3,...] == 1) | (tn[:,4,...] == 1)).to(tn.dtype)  # [B,D,H,W]
+                tprob_raw  = tn[:, 3:, ...].clone()
+                tprob_blur = blur_targets(tprob_raw, kernel_size=3, sigma=sigma_sched.value)
+
+                T_norm.append(tn)
+                T_prob_raw.append(tprob_raw)
+                T_prob_blur.append(tprob_blur)
+                T_valid.append(valid)
+
+        # ===== PHASE 1: Build cost matrix [B,S,5] with NO GRAD (same losses) =====
+        with torch.no_grad():
+            preds_no_grad = []
+            for _ in range(S):
+                gout = gen_model(volumes, steps[0].item())        # [B,C,D,H,W]
+                gout = _normalize_dirs_nograd(gout)               # your dir normalization
+                preds_no_grad.append(gout)
+
+            rows = []  # each row: [B,5]
+            for s in range(S):
+                ps = preds_no_grad[s]
+                p_dir = ps[:, :3, ...]
+                p_prb = ps[:, 3:, ...]
+                row_terms = []
+                for i in range(5):
+                    midWeights = (center_weight_mask(T_norm[i].shape[-3:], sigma=50, device=T_norm[i].device)/2)+2
+                    midWeights = midWeights.unsqueeze(0)
+                    # gen_dir_loss — EXACTLY your formula
+                    l_dir_ps = _cos_dir_loss_per_sample(p_dir, T_norm[i][:, :3, ...], T_valid[i], midWeights)  # [B]
+                    # gen_prob_loss — EXACTLY your call (CE against UNBLURRED targets)
+                    weights = torch.tensor([0.055, 0.07, 0.875], device=device)
+                    l_prob_ps = F.cross_entropy(p_prb, T_prob_raw[i], label_smoothing=0.075, weight=weights, reduction='none')*midWeights
+                    # reduction='none' returns [B, C?, ...]? CE expects class targets normally;
+                    # your code uses distribution (one-hot / probs). Keep it: reduction='none' then mean over spatial dims.
+                    # F.cross_entropy with probs target returns per-element loss; average over dims to [B]:
+                    if l_prob_ps.ndim > 1:
+                        l_prob_ps = l_prob_ps.mean(dim=tuple(range(1, l_prob_ps.ndim)))  # [B]
+
+                    # adv_loss (generator-side) for cost: EXACTLY your disc_criterion(..., ones)
+                    adv_out = disc_model(ps)
+                    l_adv_ps = disc_criterion(adv_out, torch.ones_like(adv_out))
+                    if l_adv_ps.ndim > 1:
+                        l_adv_ps = l_adv_ps.mean(dim=tuple(range(1, l_adv_ps.ndim)))  # [B]
+
+                    row_terms.append(gen_dir_weight*l_dir_ps + gen_prob_weight*l_prob_ps + adv_weight*l_adv_ps)  # [B]
+                rows.append(torch.stack(row_terms, dim=1))  # [B,5]
+
+            cost_mat = torch.stack(rows, dim=1).detach()  # [B,S,5]
+
+        # ===== Matching on detached costs =====
+        match_mask = _greedy_match(cost_mat)  # [B,S,5]
+        if match_mask.sum() == 0:
+            continue  # skip degenerate batch
+
+        # ===== PHASE 2: Discriminator update (one backward) =====
+        set_requires_grad(gen_model, False)
+        set_requires_grad(disc_model, True)
+        disc_optimizer.zero_grad(set_to_none=True)
+
+        disc_terms = []
+        with torch.no_grad():
+            # precompute S fakes for D (following your exact fake pipeline)
+            fakes_for_D = []
+            for _ in range(S):
+                gout = gen_model(volumes, steps[0].item())
+                gout = _normalize_dirs_nograd(gout)
+                fake_output = gout.detach().clone()
+                idx = fake_output[:, -3:, ...].argmax(dim=1, keepdim=True)
+                fake_output[:, -3:, ...] = torch.zeros_like(fake_output[:, -3:, ...]).scatter_(1, idx, 1.0)
+                fakes_for_D.append(fake_output)
+
+        # accumulate real/fake using matched pairs
+        for s in range(S):
+            for i in range(5):
+                if not match_mask[:, s, i].any():
+                    continue
+                # REAL: your exact call
+                disc_outputs_real = disc_model(T_norm[i])  # you passed 'targets' (which you had normalized in-place)
+                real_loss = disc_criterion(disc_outputs_real, torch.full_like(disc_outputs_real, 0.85))
+                # FAKE: your exact call (binarized channels, 0.15)
+                disc_outputs_fake = disc_model(fakes_for_D[s])
+                fake_loss = disc_criterion(disc_outputs_fake, torch.full_like(disc_outputs_fake, 0.15))
+                term = (fake_loss * fake_weight) + (real_loss * real_weight)
+                print(f"[Discriminator {len(disc_terms)+1}/5]")
+                print(f"Real: {real_loss.item():.6f} [{(real_loss*real_weight).item():.6f}]")
+                print(f"Fake: {fake_loss.item():.6f} [{(fake_loss*fake_weight).item():.6f}]")
+                print(f"Total: {(real_loss + fake_loss).item():.6f} "
+                    f"[{((real_loss*real_weight) + (fake_loss*fake_weight)).item():.6f}]")
+
+                # reduce to scalar
+                if term.ndim > 0:
+                    term = term.mean()
+                disc_terms.append(term)
+
+        disc_loss = torch.stack(disc_terms).mean()
+        disc_loss.backward()
+        disc_optimizer.step()
+
+        # ===== PHASE 3: Generator update (one backward) =====
+        pairs_mask = match_mask.any(dim=0)
+        num_terms  = int(pairs_mask.sum().item())
+        set_requires_grad(disc_model, False)            # adv grads go into gen only
+        set_requires_grad(gen_model, True)
+        gen_optimizer.zero_grad(set_to_none=True)
+
+        printed = 0
+        for s in range(S):
+            if not pairs_mask[s].any():
+                continue
+
+            # We recompute the forward for EACH matched (s,i). This trades a bit of compute for much lower memory.
+            for i in range(5):
+                if not pairs_mask[s, i]:
+                    continue
+
+                # forward WITH grad
+                gen_outputs  = gen_model(volumes, steps[0].item())
+                gen_outputs  = _normalize_dirs_grad(gen_outputs)     # grad-preserving normalize
+                directions   = gen_outputs[:, :3, ...]
+                probabilities= gen_outputs[:, 3:, ...]
+
+                # (optional) restrict to batch items that matched this (s,i)
+                bmask = match_mask[:, s, i]                           # [B] bool
+
+                # ---- gen_dir_loss (same math) ----
+                midWeights = (center_weight_mask(T_norm[i].shape[-3:], sigma=50, device=T_norm[i].device)/2)+2
+                midWeights = midWeights.unsqueeze(0)
+                dir_vec       = _cos_dir_loss_per_sample(directions, T_norm[i][:, :3, ...], T_valid[i], midWeights)  # [B]
+                gen_dir_loss  = (dir_vec[bmask].mean() if bmask.any() else dir_vec.mean())               # scalar
+
+                # ---- gen_prob_loss (memory-lean CE) ----
+                logp          = torch.log_softmax(probabilities, dim=1)          # [B,C,D,H,W]
+                valid         = T_prob_raw[i].sum(dim=1).clamp_max(1).to(logp.dtype)#T_valid[i].to(logp.dtype)                         # [B,D,H,W]
+                ce_map        = -(T_prob_raw[i] * logp).sum(dim=1)  
+                ce_map   = ce_map * midWeights              # [B,D,H,W]
+                num           = (ce_map * valid).sum(dim=(1,2,3))                 # [B]
+                den           = valid.sum(dim=(1,2,3)).clamp_min(1)               # [B]
+                prob_vec      = num / den                                         # [B]
+                gen_prob_loss = (prob_vec[bmask].mean() if bmask.any() else prob_vec.mean())
+
+                # ---- adv loss (your exact form) ----
+                adv_out   = disc_model(gen_outputs)
+                adv_vec   = ((adv_out - torch.ones_like(adv_out))**2).mean(dim=tuple(range(1, adv_out.ndim)))  # [B]
+                adv_loss  = (adv_vec[bmask].mean() if bmask.any() else adv_vec.mean())
+
+                # ---- weighted sum, scale for accumulation, then immediate backward ----
+                gterm = gen_dir_loss*gen_dir_weight + gen_prob_loss*gen_prob_weight + adv_loss*adv_weight
+                (gterm / num_terms).backward()    # << no retain_graph; this frees the graph right away
+
+                # 5-line print
+                printed += 1
+                print(f"[Generator {printed}/5]")
+                print(f"Gen_dir:  {gen_dir_loss.item():.6f} [{(gen_dir_loss*gen_dir_weight).item():.6f}]")
+                print(f"Gen_prob: {gen_prob_loss.item():.6f} [{(gen_prob_loss*gen_prob_weight).item():.6f}]")
+                print(f"Adv:      {adv_loss.item():.6f} [{(adv_loss*adv_weight).item():.6f}]")
+                print(f"Total:    {(gen_dir_loss + gen_prob_loss + adv_loss).item():.6f} "
+                    f"[{(gen_dir_loss*gen_dir_weight + gen_prob_loss*gen_prob_weight + adv_loss*adv_weight).item():.6f}]")
+                
+
+                gdir  = float(gen_dir_loss.detach())
+                gprob = float(gen_prob_loss.detach())
+                gadv  = float(adv_loss.detach())
+
+                running_gen_prob_loss += gprob * B
+                running_gen_dir_loss  += gdir  * B
+                running_adv_loss      += gadv  * B
+
+                running_loss += gprob + gdir + gadv
+
+                # (optional) free temps early
+                del gen_outputs, directions, probabilities, logp, ce_map, adv_out
+
+        gen_optimizer.step()
+
+        # ===== Logging (same quantities) =====
+
+
+        # recompute quick D real/fake for logs (cheap, no grad)
+        with torch.no_grad():
+            disc_real_log = disc_model(T_norm[0])
+            real_loss_log = disc_criterion(disc_real_log, torch.full_like(disc_real_log, 0.85)).mean()
+            fake_quick = _normalize_dirs_nograd(gen_model(volumes, steps[0].item()))
+            idx = fake_quick[:, -3:, ...].argmax(dim=1, keepdim=True)
+            fake_quick[:, -3:, ...] = torch.zeros_like(fake_quick[:, -3:, ...]).scatter_(1, idx, 1.0)
+            disc_fake_log = disc_model(fake_quick)
+            fake_loss_log = disc_criterion(disc_fake_log, torch.full_like(disc_fake_log, 0.15)).mean()
+
+        running_loss          += (float(real_loss_log) + float(fake_loss_log)) * B
+        running_real_loss     += float(real_loss_log) * B
+        running_fake_loss     += float(fake_loss_log) * B
+        total += B
+
+    # ===== end-epoch prints / sched =====
+    printAndLog("\n")
+    printAndLog("Epoch_gen_prob:" + str( running_gen_prob_loss/total) + "[" + str( running_gen_prob_loss*gen_prob_weight/total) + "]" + "\n")
+    printAndLog("Epoch_gen_dir:"  + str( running_gen_dir_loss /total) + "[" + str( running_gen_dir_loss *gen_dir_weight /total) + "]" + "\n")
+    printAndLog("Epoch_real:"     + str( running_real_loss    /total) + "[" + str( running_real_loss    *1.0         /total) + "]" + "\n")
+    printAndLog("Epoch_fake:"     + str( running_fake_loss    /total) + "[" + str( running_fake_loss    *1.0         /total) + "]" + "\n")
+    printAndLog("Epoch_adv:"      + str( running_adv_loss     /total) + "[" + str( running_adv_loss     *adv_weight   /total) + "]" + "\n")
+
+    avg_D_Loss  = ((running_real_loss + running_fake_loss)/total)/2 
+    d_loss_diff = (abs(running_real_loss - running_fake_loss))/total
+    avg_D_Loss_weighted  = ((running_real_loss*1.0 + running_fake_loss*1.0)/total)/2 
+    d_loss_weighted_diff = (abs(running_real_loss*1.0 - running_fake_loss*1.0))/total
+
+    printAndLog("avg_D_Loss:" + str(avg_D_Loss) + "[" + str( avg_D_Loss_weighted) + "]" + "\n")
+    printAndLog("d_loss_diff:" + str(d_loss_diff) + "[" + str( d_loss_weighted_diff) + "]" + "\n")
+    printAndLog("------------------------------------------" + "\n")
+
+    needToPrint = True
+    for m in disc_model.modules():
+        if isinstance(m, ScheduledDropout):
+            m.step()
+            if needToPrint:
+                printAndLog(f"New dropout: {m.value:.4f}")
+                needToPrint=False
+
+    sigma_sched.step()
+    printAndLog(f"New sigma: {sigma_sched.value:.4f}")
+
+    return running_loss / max(total, 1)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def trainOld(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_dist_criterion, gen_dir_criterion, disc_criterion, device, epochNumber):
     global skipNextDiscBackProp, skipNextGenBackProp
     global sigma_sched
     gen_model.train()
@@ -155,6 +672,7 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
     running_real_loss = 0.0
     running_fake_loss = 0.0
     running_adv_loss = 0.0
+    eps = 1e-8
 
     real_weight = 1
     fake_weight = 1
@@ -175,195 +693,216 @@ def train(gen_model, disc_model, dataloader, gen_optimizer, disc_optimizer, gen_
     skipThisDiscBackProp = False
 
 
-    accum_steps = 4  # simulate batch_size = 4
+    accum_steps = 1  # simulate batch_size = 4
     gen_optimizer.zero_grad(set_to_none=True)
     disc_optimizer.zero_grad(set_to_none=True)
-    for i, (volumes, targets, steps, path1, path2) in enumerate(dataloader, start=1):
+    for i, (volumes, targets1,targets2,targets3,targets4,targets5, steps, path1) in enumerate(dataloader, start=1):
         volumes = volumes.to(device)
-        targets = targets.to(device)
+        targets1 = targets1.to(device)
+        targets2 = targets2.to(device)
+        targets3 = targets3.to(device)
+        targets4 = targets4.to(device)
+        targets5 = targets5.to(device)
 
 
         assert torch.isfinite(volumes).all()
-        assert torch.isfinite(targets).all()
+        assert torch.isfinite(targets1).all()
+        assert torch.isfinite(targets2).all()
+        assert torch.isfinite(targets3).all()
+        assert torch.isfinite(targets4).all()
+        assert torch.isfinite(targets5).all()
 
-        if skipNextDiscBackProp:
-            skipThisDiscBackProp = True
-
-        if skipNextGenBackProp:
-            skipThisGenBackProp = True
-
-
-        #B = volumes.shape[0]
-        #z = torch.randn(B, noise_dim, device=device) * 0.1
-
-        #Generate our predicted values
-        #with autocast():
-        
         B, _, D, H, W = volumes.shape
 
+        allTargets = (targets1,targets2,targets3,targets4,targets5)
 
-        gen_outputs = gen_model(volumes, steps[0].item())
+        genLossesRow = []
+        discLossesRow = []
+
+        genLosses = []
+        discLosses = []
+
+        for _ in range(len(allTargets)):
+            gen_outputs = gen_model(volumes, steps[0].item())
+
+    
+            directions = gen_outputs[:, :3, ...]
+
+            probabilities = gen_outputs[:, 3:, ...] 
+
+            p = directions.clone()
+            p_norm = torch.linalg.norm(p, dim=1, keepdim=True).clamp_min(eps)
+            gen_outputs[:, :3, ...] = p / p_norm
+
+            for i in range(len(allTargets)):
+                torch.cuda.empty_cache()
+                targets = allTargets[i]
+
+        #with autocast():  
+
+                target_directions = targets[:, :3, ...]
+
+                valid = ((targets[:,3,...] == 1) | (targets[:,4,...] == 1))
+                
+                target_probabilities = targets[:, 3:, ...]
+
+
+                # Normalize the direction channels
+                # bound raw logits
+                g = target_directions.detach()       # no grad through targets
+
+                # Compute norms safely
+                
+                g_norm = torch.linalg.norm(g, dim=1, keepdim=True).clamp_min(eps)
+
+                # Replace *first three* channels with normalized unit vectors
+                
+                targets[:, :3, ...]     = g / g_norm
+                m = valid.to(p.dtype)
+                # cosine similarity per voxel -> [B,D,H,W]
+                cos_sim = (gen_outputs[:, :3, ...] * targets[:, :3, ...]).sum(dim=1)
+
+                # mask exactly like your SmoothL1 path
+                per_voxel = 1.0 - cos_sim                   # 0 aligned, 2 opposite
+                num = (per_voxel * m).sum(dim=(1,2,3))
+                den = m.sum(dim=(1,2,3)).clamp_min(1)
+                gen_dir_loss = (num / den).mean()
+
+
+
+
+
+
+                #gen_dir_loss = F.smooth_l1_loss(directions[valid], target_directions[valid]).mean(dim=1).mean()
+                #gen_dist_loss = gen_dist_criterion(gen_outputs[:, -1:, ...], targets[:, -1:, ...])
+
+
+                gen_prob_loss = F.cross_entropy(probabilities, target_probabilities, label_smoothing=0.075)
                 
 
-        #directions = (gen_outputs[:, :3, ...] / gen_outputs[:, :3, ...].norm(dim=1, keepdim=True).clamp_min(1e-8)).clone()
-        directions = gen_outputs[:, :3, ...]
+                #target_idx = target_probabilities.argmax(dim=1).long()
+                #gen_prob_loss = F.cross_entropy(probabilities, target_idx)
 
-        probabilities = gen_outputs[:, 3:, ...]   
+                target_probabilities = blur_targets(targets[:, 3:, ...], kernel_size=3, sigma=sigma_sched.value)
+                
+                
+                blurred_targets = targets #blur_targets(targets, kernel_size=3, sigma=0.2)
+                
+                
+                
+                disc_outputs = disc_model(blurred_targets)
 
-        target_directions = targets[:, :3, ...]
-
-        valid = ((targets[:,3,...] == 1) | (targets[:,4,...] == 1))
-        
-        target_probabilities = targets[:, 3:, ...]
-
-
-        #quiver_slice_zyx(volumes[0],  axis='y', index=98, stride=1, arrowScale=10.0, exclude_boundary_target=False)
-        
-        #gen_dir_loss = (1 - F.cosine_similarity(directions, target_directions, dim=1))[valid].mean()
-
-        
-        
-        
-        
-        #mask = valid.float()  # [B,D,H,W]
-
-        #per_comp  = F.smooth_l1_loss(directions, target_directions, reduction='none')   # [B,3,D,H,W]
-        #per_voxel = per_comp.mean(dim=1)                            # [B,D,H,W]
-
-        #num = (per_voxel * mask).sum(dim=(1,2,3))
-        #den = mask.sum(dim=(1,2,3)).clamp_min(1)
-        #per_sample = num / den
-
-        #gen_dir_loss = per_sample.mean()
+                real_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.85)) #0.9?
 
 
+                fake_output = gen_outputs.detach()
+
+                idx = fake_output[:, -3:, ...].argmax(dim=1, keepdim=True)        # [B,1,D,H,W]
+                fake_output[:, -3:, ...] = torch.zeros_like(fake_output[:, -3:, ...]).scatter_(1, idx, 1.0)   
+
+                #fake_output[:, :3] = fake_output[:, :3].masked_fill(~valid, 0)
+                #fake_output[:, -1] = fake_output[:, -1].masked_fill(~valid, -1)
+
+                disc_outputs = disc_model(fake_output)
+
+                fake_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.15)) #0.1?
 
 
-        eps = 1e-8
+                #fake_output = torch.zeros_like(gen_outputs).scatter_(
+                    #dim=1,
+                    #index=gen_outputs.argmax(dim=1, keepdim=True),
+                    #value=1.0)
 
-
-        # Normalize the direction channels
-        p = directions.clone()   # bound raw logits
-        g = target_directions.detach()       # no grad through targets
-
-        # Compute norms safely
-        p_norm = torch.linalg.norm(p, dim=1, keepdim=True).clamp_min(eps)
-        g_norm = torch.linalg.norm(g, dim=1, keepdim=True).clamp_min(eps)
-
-        # Replace *first three* channels with normalized unit vectors
-        gen_outputs[:, :3, ...] = p / p_norm
-        targets[:, :3, ...]     = g / g_norm
-        m = valid.to(p.dtype)
-        # cosine similarity per voxel -> [B,D,H,W]
-        cos_sim = (gen_outputs[:, :3, ...] * targets[:, :3, ...]).sum(dim=1)
-
-        # mask exactly like your SmoothL1 path
-        per_voxel = 1.0 - cos_sim                   # 0 aligned, 2 opposite
-        num = (per_voxel * m).sum(dim=(1,2,3))
-        den = m.sum(dim=(1,2,3)).clamp_min(1)
-        gen_dir_loss = (num / den).mean()
+                fake_output = gen_outputs
 
 
 
 
+                #disc_optimizer.zero_grad()
+                #scaler.scale((fake_loss * fake_weight) + (real_loss*real_weight)).backward()
+                #scaler.step(disc_optimizer)
+                #scaler.update()
+                if True:
+                    discLossesRow.append((fake_loss * fake_weight) + (real_loss * real_weight))
+                else:
+                    (((fake_loss * fake_weight) + (real_loss * real_weight))/accum_steps).backward()
+                    if i % accum_steps == 0 or i == len(dataloader):
+                        disc_optimizer.step()
+                        print("Stepping Disc")
+                        disc_optimizer.zero_grad(set_to_none=True)
+
+                #disc_optimizer.step()
+                
+
+                disc_outputs2 = disc_model(fake_output)
+
+                adv_loss = disc_criterion(disc_outputs2, torch.ones_like(disc_outputs2))
+
+                
+                assert torch.isfinite(gen_dir_loss).all()
+                assert torch.isfinite(gen_prob_loss).all()
+                assert torch.isfinite(adv_loss).all()
+                #gen_optimizer.zero_grad()
+                #scaler.scale((gen_dir_loss*gen_dir_weight) + (gen_prob_loss*gen_prob_weight) + (adv_loss*adv_weight)).backward()
+                #scaler.step(gen_optimizer)
+                #scaler.update()
+                if True:
+                    genLossesRow.append((gen_dir_loss*gen_dir_weight) + (gen_prob_loss*gen_prob_weight) + (adv_loss*adv_weight))
+                else:
+                    (((gen_dir_loss*gen_dir_weight) + (gen_prob_loss*gen_prob_weight) + (adv_loss*adv_weight))/accum_steps).backward()
+                    if i % accum_steps == 0 or i == len(dataloader):
+                        print("Stepping Gen")
+                        gen_optimizer.step()
+                        gen_optimizer.zero_grad(set_to_none=True)
+                #gen_optimizer.step()
+                
+
+            genLosses.append(genLossesRow)
+            discLosses.append(discLossesRow)
+
+            genLossesRow = []
+            discLossesRow = []
 
 
-        #gen_dir_loss = F.smooth_l1_loss(directions[valid], target_directions[valid]).mean(dim=1).mean()
-        #gen_dist_loss = gen_dist_criterion(gen_outputs[:, -1:, ...], targets[:, -1:, ...])
+    genLosses = torch.stack([torch.stack(row, dim=0) for row in genLosses], dim=0)  # [5,5]
+    discLosses = torch.stack([torch.stack(row, dim=0) for row in discLosses], dim=0)
+
+    gen_loss, disc_loss = match_losses(genLosses, discLosses)
+
+    set_requires_grad(gen_model, False)
+    assert torch.isfinite(fake_loss).all()
+    assert torch.isfinite(real_loss).all()
+    disc_optimizer.zero_grad(set_to_none=True)
+    disc_loss.backward()
+    disc_optimizer.step()
+    set_requires_grad(gen_model, True)
+
+    set_requires_grad(disc_model, False)
+    gen_optimizer.zero_grad(set_to_none=True)
+    gen_loss.backward()
+    gen_optimizer.step()
+    set_requires_grad(disc_model, True)
 
 
-        gen_prob_loss = F.cross_entropy(probabilities, target_probabilities, label_smoothing=0.075)
-        
-
-        #target_idx = target_probabilities.argmax(dim=1).long()
-        #gen_prob_loss = F.cross_entropy(probabilities, target_idx)
-
-        target_probabilities = blur_targets(targets[:, 3:, ...], kernel_size=3, sigma=sigma_sched.value)
-        
-        
-        blurred_targets = targets #blur_targets(targets, kernel_size=3, sigma=0.2)
-        
-        
-        
-        disc_outputs = disc_model(blurred_targets)
-
-        real_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.85)) #0.9?
 
 
-        fake_output = gen_outputs.detach()
+    assert_all_params_finite(gen_model)
+    assert_all_params_finite(disc_model)
 
-        idx = fake_output[:, -3:, ...].argmax(dim=1, keepdim=True)        # [B,1,D,H,W]
-        fake_output[:, -3:, ...] = torch.zeros_like(fake_output[:, -3:, ...]).scatter_(1, idx, 1.0)   
+    print("Steps: ", steps[0].item())
+    print("Gen_prob_Loss: ", gen_prob_loss.item(), "[", (gen_prob_loss*gen_prob_weight).item(),"]")
+    print("Gen_dir_Loss: ", gen_dir_loss.item(), "[", (gen_dir_loss*gen_dir_weight).item(),"]")
+    print("real_Loss: ", real_loss.item(), "[", (real_loss*real_weight).item(),"]")
+    print("fake_Loss: ", fake_loss.item(), "[", (fake_loss * fake_weight).item(),"]")
+    print("adv_Loss: ", adv_loss.item(), "[", (adv_loss*adv_weight).item(),"]")
 
-        #fake_output[:, :3] = fake_output[:, :3].masked_fill(~valid, 0)
-        #fake_output[:, -1] = fake_output[:, -1].masked_fill(~valid, -1)
-
-        disc_outputs = disc_model(fake_output)
-
-        fake_loss = disc_criterion(disc_outputs, torch.full_like(disc_outputs, 0.15)) #0.1?
-
-
-        #fake_output = torch.zeros_like(gen_outputs).scatter_(
-            #dim=1,
-            #index=gen_outputs.argmax(dim=1, keepdim=True),
-            #value=1.0)
-
-        fake_output = gen_outputs
-
-        set_requires_grad(gen_model, False)
-        assert torch.isfinite(fake_loss).all()
-        assert torch.isfinite(real_loss).all()
-        #disc_optimizer.zero_grad()
-        #scaler.scale((fake_loss * fake_weight) + (real_loss*real_weight)).backward()
-        #scaler.step(disc_optimizer)
-        #scaler.update()
-        (((fake_loss * fake_weight) + (real_loss * real_weight))/accum_steps).backward()
-        if i % accum_steps == 0 or i == len(dataloader):
-            disc_optimizer.step()
-            print("Stepping Disc")
-            disc_optimizer.zero_grad(set_to_none=True)
-
-        #disc_optimizer.step()
-        set_requires_grad(gen_model, True)
-
-        disc_outputs2 = disc_model(fake_output)
-
-        adv_loss = disc_criterion(disc_outputs2, torch.ones_like(disc_outputs2))
-
-        set_requires_grad(disc_model, False)
-        assert torch.isfinite(gen_dir_loss).all()
-        assert torch.isfinite(gen_prob_loss).all()
-        assert torch.isfinite(adv_loss).all()
-        #gen_optimizer.zero_grad()
-        #scaler.scale((gen_dir_loss*gen_dir_weight) + (gen_prob_loss*gen_prob_weight) + (adv_loss*adv_weight)).backward()
-        #scaler.step(gen_optimizer)
-        #scaler.update()
-        (((gen_dir_loss*gen_dir_weight) + (gen_prob_loss*gen_prob_weight) + (adv_loss*adv_weight))/accum_steps).backward()
-        if i % accum_steps == 0 or i == len(dataloader):
-            print("Stepping Gen")
-            gen_optimizer.step()
-            gen_optimizer.zero_grad(set_to_none=True)
-        #gen_optimizer.step()
-        set_requires_grad(disc_model, True)
-
-
-        assert_all_params_finite(gen_model)
-        assert_all_params_finite(disc_model)
-
-        print("Steps: ", steps[0].item())
-        print("Gen_prob_Loss: ", gen_prob_loss.item(), "[", (gen_prob_loss*gen_prob_weight).item(),"]")
-        print("Gen_dir_Loss: ", gen_dir_loss.item(), "[", (gen_dir_loss*gen_dir_weight).item(),"]")
-        print("real_Loss: ", real_loss.item(), "[", (real_loss*real_weight).item(),"]")
-        print("fake_Loss: ", fake_loss.item(), "[", (fake_loss * fake_weight).item(),"]")
-        print("adv_Loss: ", adv_loss.item(), "[", (adv_loss*adv_weight).item(),"]")
-
-        running_loss += (gen_prob_loss.item() + gen_dir_loss.item() + real_loss.item() + fake_loss.item() + adv_loss.item()) * volumes.size(0)
-        running_gen_prob_loss += (gen_prob_loss.item()) * volumes.size(0)
-        running_gen_dir_loss += (gen_dir_loss.item()) * volumes.size(0)
-        running_real_loss += (real_loss.item()) * volumes.size(0)
-        running_fake_loss += (fake_loss.item()) * volumes.size(0)
-        running_adv_loss += (adv_loss.item()) * volumes.size(0)
-        total += volumes.size(0)
+    running_loss += (gen_prob_loss.item() + gen_dir_loss.item() + real_loss.item() + fake_loss.item() + adv_loss.item()) * volumes.size(0)
+    running_gen_prob_loss += (gen_prob_loss.item()) * volumes.size(0)
+    running_gen_dir_loss += (gen_dir_loss.item()) * volumes.size(0)
+    running_real_loss += (real_loss.item()) * volumes.size(0)
+    running_fake_loss += (fake_loss.item()) * volumes.size(0)
+    running_adv_loss += (adv_loss.item()) * volumes.size(0)
+    total += volumes.size(0)
 
 
     printAndLog("\n")
@@ -1092,12 +1631,27 @@ def main():
 
     if gen_state: #We loaded a checkpoint. (We wouldn't if it was the first run)
         gen_epoch = gen_state['epoch'] #Load the checkpoint the generator was on
-        gen_model.load_state_dict(gen_state['model_state_dict'], strict=False) #Load the weights and biases
+        #gen_model.load_state_dict(gen_state['model_state_dict'], strict=False) #Load the weights and biases
+
+        sg_in  = gen_state["model_state_dict"]           # what you saved
+        sg_cur = gen_model.state_dict()            # what the model expects now
+
+        # keep only keys that exist AND match shape
+        sg_filt = {k: v for k, v in sg_in.items()
+                if (k in sg_cur) and (v.shape == sg_cur[k].shape)}
+        gen_model.load_state_dict(sg_filt, strict=False) #Load the weights and biases
 
     if disc_state: #We loaded a checkpoint. (We wouldn't if it was the first run)
         disc_epoch = disc_state['epoch'] #Load the checkpoint the discriminator was on
         
-        disc_model.load_state_dict(disc_state['model_state_dict'], strict=False) #Load the weights and biases
+
+        sd_in  = disc_state["model_state_dict"]           # what you saved
+        sd_cur = disc_model.state_dict()            # what the model expects now
+
+        # keep only keys that exist AND match shape
+        sd_filt = {k: v for k, v in sd_in.items()
+                if (k in sd_cur) and (v.shape == sd_cur[k].shape)}
+        disc_model.load_state_dict(sd_filt, strict=False) #Load the weights and biases
 
 
     gen_param_groups  = add_weight_decay(gen_model,  wd=3e-4)

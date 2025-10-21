@@ -646,148 +646,6 @@ def splat_flow_nearest(flow: torch.Tensor):
     return out.squeeze(0) if not has_batch else out
 
 
-import torch
-
-import torch
-
-import torch
-
-import torch
-from typing import Optional, Tuple
-
-import torch
-from typing import Optional, Tuple
-
-import torch
-from typing import Optional, Tuple
-
-import torch
-from typing import Optional, Tuple
-
-import torch
-import torch.nn.functional as F
-from typing import Optional, Tuple
-
-import torch
-from typing import Optional, Tuple
-
-@torch.no_grad()
-def sum_with_next_from(
-    flow_vals: torch.Tensor,           # evolving accumulator (e.g., tmp)
-    flow_dirs: torch.Tensor,           # field used to compute destinations (e.g., smoothedDistance)
-    avoid_self: bool = True,
-    mask: Optional[torch.Tensor] = None,    # previous self-pointing mask (bool), or None
-    neighbor_vals: Optional[torch.Tensor] = None,  # if set, gather neighbor from here
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    For each voxel i: out[i] = flow_vals[i] + neighbor_vals[ dest(i) ],
-    where dest(i) = i + round(flow_dirs[i]) (nearest, clamped).
-
-    Shapes: (3,D,H,W) or (N,3,D,H,W) for all tensors.
-
-    Stops updating when:
-      - A voxel points to itself on two consecutive calls (mask & self_now), OR
-      - Its (rounded) destination would be out of bounds (immediate stop for that call), OR
-      - The neighbor vector at dest has any NaN component (skip add to avoid propagating NaN).
-      - (If avoid_self) skip add when dest == self.
-
-    Returns:
-      out, self_now
-        out: summed tensor, same shape as flow_vals
-        self_now: bool mask (N,D,H,W) or (D,H,W), True where dest==self (this call)
-    """
-    # ---- shape checks & batching ----
-    assert flow_vals.shape == flow_dirs.shape and flow_vals.dim() in (4, 5), \
-        "flow_vals and flow_dirs must have same shape: (3,D,H,W) or (N,3,D,H,W)"
-    has_batch = (flow_dirs.dim() == 5)
-    if neighbor_vals is None:
-        neighbor_vals = flow_vals
-    else:
-        assert neighbor_vals.shape == flow_vals.shape, "neighbor_vals must match flow_vals shape"
-
-    if not has_batch:
-        flow_vals    = flow_vals.unsqueeze(0)
-        flow_dirs    = flow_dirs.unsqueeze(0)
-        neighbor_vals = neighbor_vals.unsqueeze(0)
-
-    N, C, D, H, W = flow_vals.shape
-    assert C == 3
-    dev  = flow_vals.device
-
-    # ---- validity of directions ----
-    dz, dy, dx = flow_dirs[:, 0], flow_dirs[:, 1], flow_dirs[:, 2]
-    mag   = torch.sqrt(dz*dz + dy*dy + dx*dx)
-    valid = torch.isfinite(mag) & (mag > 0)
-
-    # ---- grid coords ----
-    z = torch.arange(D, device=dev, dtype=torch.float32)
-    y = torch.arange(H, device=dev, dtype=torch.float32)
-    x = torch.arange(W, device=dev, dtype=torch.float32)
-    Z, Y, X = torch.meshgrid(z, y, x, indexing='ij')
-    Z = Z.unsqueeze(0).expand(N, -1, -1, -1)
-    Y = Y.unsqueeze(0).expand(N, -1, -1, -1)
-    X = X.unsqueeze(0).expand(N, -1, -1, -1)
-
-    # ---- destination (rounded BEFORE clamp to detect OOB) ----
-    RZ = torch.where(valid, Z + dz, Z).round()
-    RY = torch.where(valid, Y + dy, Y).round()
-    RX = torch.where(valid, X + dx, X).round()
-
-    oob_now = (RZ < 0) | (RZ >= D) | (RY < 0) | (RY >= H) | (RX < 0) | (RX >= W)
-
-    TZ = RZ.clamp(0, D-1).to(torch.long)
-    TY = RY.clamp(0, H-1).to(torch.long)
-    TX = RX.clamp(0, W-1).to(torch.long)
-
-    ZL, YL, XL = Z.to(torch.long), Y.to(torch.long), X.to(torch.long)
-
-    # ---- self detection (this call) ----
-    self_now = (TZ == ZL) & (TY == YL) & (TX == XL)  # (N,D,H,W) bool
-
-    # ---- previous self mask ----
-    if mask is None:
-        prev_self = torch.zeros_like(self_now, dtype=torch.int32, device=dev)
-    else:
-        prev_self = mask.to(device=dev, dtype=torch.int32)
-        if prev_self.dim() == 3:  # allow (D,H,W)
-            prev_self = prev_self.unsqueeze(0)
-        assert prev_self.shape == self_now.shape
-
-    # ---- stopping logic ----
-    stop = (prev_self > 50) | oob_now
-
-    eff_valid = valid & ~stop
-    if avoid_self:
-        eff_valid = eff_valid & ~self_now  # skip doubling
-
-    # ---- gather neighbor from neighbor_vals (NOT from flow_vals) ----
-    dest_lin = (TZ*H*W + TY*W + TX).view(N, -1)     # (N,P)
-    idx      = dest_lin.unsqueeze(1).expand(N, C, -1)
-
-    vals_flat   = flow_vals.view(N, C, -1)
-    neigh_flat  = neighbor_vals.view(N, C, -1)
-    next_flat   = torch.gather(neigh_flat, 2, idx)  # from neighbor_vals
-
-    # ---- NaN-safe add: zero-out neighbors with any NaN component, and apply eff_valid ----
-    neighbor_ok = torch.isfinite(next_flat).all(dim=1, keepdim=True)            # (N,1,P)
-    add_mask    = eff_valid.view(N, 1, -1) & neighbor_ok                        # (N,1,P)
-    add_mask_exp = add_mask.expand_as(next_flat)                                # (N,3,P)
-    next_safe    = torch.where(add_mask_exp, next_flat, torch.zeros_like(next_flat))
-
-    out_flat = vals_flat + next_safe
-    out = out_flat.view(N, C, D, H, W)
-
-    if not has_batch:
-        out = out.squeeze(0)
-        self_now = self_now.squeeze(0)
-
-    return out, self_now+prev_self
-
-import torch
-from typing import Optional, Tuple
-
-import torch
-from typing import Optional, Tuple
 
 @torch.no_grad()
 def remove_vectors_pointing_to_nan(
@@ -1121,86 +979,15 @@ def point_to_centers_grid(flow: torch.Tensor,
 
 import torch
 
-@torch.no_grad()
-def displacements_to_coords(out: torch.Tensor, round_to_int: bool = True):
-    """
-    out: (3,D,H,W) or (N,3,D,H,W) displacement field in voxel units
-         (dz, dy, dx) = vector FROM each voxel TO its target.
-    Returns:
-      coords: same shape as out, but channels hold ABSOLUTE target coords (z,y,x).
-              If round_to_int=True -> integer voxel indices (clamped in-bounds).
-              Else -> float coords.
-    """
-    nanMask = (torch.isnan(out))
-    has_batch = (out.ndim == 5)
-    if not has_batch: out = out.unsqueeze(0)              # (1,3,D,H,W)
-    N, C, D, H, W = out.shape; assert C == 3
-    device, dtype = out.device, out.dtype
-
-    z = torch.arange(D, device=device, dtype=dtype)
-    y = torch.arange(H, device=device, dtype=dtype)
-    x = torch.arange(W, device=device, dtype=dtype)
-    Z, Y, X = torch.meshgrid(z, y, x, indexing='ij')       # (D,H,W)
-
-    base = torch.stack([Z, Y, X], dim=0).unsqueeze(0)      # (1,3,D,H,W)
-    coords = base + out                                    # absolute targets
-
-    if round_to_int:
-        coords = coords.round()
-        coords[:,0].clamp_(0, D-1); coords[:,1].clamp_(0, H-1); coords[:,2].clamp_(0, W-1)
-        coords = coords.to(torch.float32)
-    if not has_batch:
-        coords = coords.squeeze(0)
-
-
-    coords[nanMask] = torch.nan
-    return coords
 
 import torch
 
-@torch.no_grad()
-def snap_vectors_to_nearest_voxel(flow: torch.Tensor) -> torch.Tensor:
-    """
-    Snap a 3D vector field to the nearest voxel targets.
-
-    Input:
-      flow: (3, D, H, W) with components (dz, dy, dx). Each vector points from (z,y,x)
-            to (z+dz, y+dy, x+dx) in continuous coords.
-
-    Output:
-      snapped: (3, D, H, W) where each vector now points exactly to the nearest voxel:
-               ( round(z+dz), round(y+dy), round(x+dx) ), clamped into bounds.
-    """
-    assert flow.ndim == 4 and flow.shape[0] == 3, "flow must be (3,D,H,W)"
-    _, D, H, W = flow.shape
-    device, dtype = flow.device, flow.dtype
-
-    # Base grid (same dtype as flow to avoid casts)
-    z = torch.arange(D, device=device, dtype=dtype)
-    y = torch.arange(H, device=device, dtype=dtype)
-    x = torch.arange(W, device=device, dtype=dtype)
-    Z, Y, X = torch.meshgrid(z, y, x, indexing='ij')  # (D,H,W)
-
-    dz, dy, dx = flow[0], flow[1], flow[2]
-
-    # Endpoint -> nearest voxel (round ties-to-even), then clamp to bounds
-    TZ = torch.round(Z + dz).clamp_(0, D - 1)
-    TY = torch.round(Y + dy).clamp_(0, H - 1)
-    TX = torch.round(X + dx).clamp_(0, W - 1)
-
-    # New displacement = snapped voxel minus origin voxel
-    snapped_dz = (TZ - Z)
-    snapped_dy = (TY - Y)
-    snapped_dx = (TX - X)
-
-    snapped = torch.stack([snapped_dz, snapped_dy, snapped_dx], dim=0).to(dtype)
-    return snapped
 
 import torch
 from typing import Optional
 
 @torch.no_grad()
-def snap_vectors_to_nearest_non_nan(
+def snap_vectors_to_nearest_non_nanOld(
     flow: torch.Tensor,
     search_radius: int = 1,
     keep_original_if_none: bool = True,
@@ -1306,6 +1093,11 @@ def snap_vectors_to_nearest_non_nan(
     snapped = torch.where(src_finite.unsqueeze(0), snapped, flow)
     return snapped
 
+
+
+
+
+
 import torch
 
 @torch.no_grad()
@@ -1361,6 +1153,89 @@ def coord_match_and_unmatched(A: torch.Tensor, B: torch.Tensor):
 
 
 
+
+import torch
+import torch.nn.functional as F
+
+
+@torch.no_grad()
+def point_vectors_to_centers_nanaware2(
+    directions: torch.Tensor,
+    iters: int = 50,
+    step: float = 1.0,
+    mask_thresh: float = 0.99,
+    snap_frequency: int = 10,            # unused
+    inward_bias: float = 0.0             # <— add this
+):
+    assert directions.ndim == 4 and directions.shape[0] == 3, "Expected (3,D,H,W)"
+    device, dtype = directions.device, directions.dtype
+    _, D, H, W = directions.shape
+
+    start_valid = torch.isfinite(directions).all(dim=0)
+
+    flow = directions.clone()
+    flow[~torch.isfinite(flow)] = 0
+    mask = torch.isfinite(directions).all(dim=0, keepdim=True).to(directions.dtype)
+
+    flow = flow.unsqueeze(0)   # (1,3,D,H,W)
+    mask4 = mask.unsqueeze(0)  # (1,1,D,H,W)
+
+    # --- inward normal field from mask ---
+    # simple central differences on mask (replicate padding)
+    k = torch.tensor([[-1., 0., 1.]], device=device, dtype=dtype) * 0.5
+    kx = k.view(1,1,1,1,3)
+    ky = k.view(1,1,1,3,1)
+    kz = k.view(1,1,3,1,1)
+    m = mask4
+    gx = F.conv3d(F.pad(m, (1,1,0,0,0,0), mode='replicate'), kx)
+    gy = F.conv3d(F.pad(m, (0,0,1,1,0,0), mode='replicate'), ky)
+    gz = F.conv3d(F.pad(m, (0,0,0,0,1,1), mode='replicate'), kz)
+    g = torch.cat([gz, gy, gx], dim=1)                 # (1,3,D,H,W) matches [dz,dy,dx]
+    g = g / (torch.linalg.norm(g, dim=1, keepdim=True).clamp_min(1e-8))  # unit inward normal
+
+    z, y, x = torch.meshgrid(
+        torch.arange(D, device=device, dtype=dtype),
+        torch.arange(H, device=device, dtype=dtype),
+        torch.arange(W, device=device, dtype=dtype),
+        indexing='ij'
+    )
+    base = torch.stack([z, y, x], dim=0)  # (3,D,H,W)
+    pos  = base.clone()
+    pos[:, ~start_valid] = base[:, ~start_valid]
+
+    def vox2norm(pz, py, px):
+        gx = 2.0 * px / (W - 1) - 1.0
+        gy = 2.0 * py / (H - 1) - 1.0
+        gz = 2.0 * pz / (D - 1) - 1.0
+        return torch.stack([gx, gy, gz], dim=-1)  # (D,H,W,3)
+
+    for _ in range(iters):
+        grid = vox2norm(pos[0], pos[1], pos[2]).unsqueeze(0)  # (1,D,H,W,3)
+        v = F.grid_sample(flow, grid, mode='bilinear',
+                          padding_mode='border', align_corners=True)[0]             # (3,D,H,W)
+        w = F.grid_sample(mask4, grid, mode='bilinear',
+                          padding_mode='border', align_corners=True)[0, 0]          # (D,H,W)
+
+        # inward bias sampled at current pos (works for 0.0 too)
+        b = inward_bias * F.grid_sample(g, grid, mode='bilinear',
+                                        padding_mode='border', align_corners=True)[0]
+
+        move_ok = (w >= mask_thresh) & start_valid
+        pos[:, move_ok] = pos[:, move_ok] + step * (v[:, move_ok] + b[:, move_ok])
+
+        pos[0].clamp_(0, D - 1)
+        pos[1].clamp_(0, H - 1)
+        pos[2].clamp_(0, W - 1)
+
+    out = pos - base
+    out[:, ~start_valid] = torch.nan
+    return out
+
+
+
+
+
+
 def vote_gap(rows: torch.Tensor, k: int) -> float:
     """
     rows: (N, 4) tensor with columns [votes, z, y, x]
@@ -1388,21 +1263,16 @@ def process_file(piffs, outdir = None, show = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     t0 = perf_counter()
-    DistanceTensor, _, Centers, WallID, wallMask = parse_voxel_file_for_distance(piffs[0], device)
+    tensor, aiCenters = parse_voxel_file_for_distance(piffs[0], device)
     print(f"{perf_counter() - t0:.6f} s")
 
 
-    DistanceTensor2, _, Centers2, _, _ = parse_voxel_file_for_distance(piffs[1])
 
     if False:
         quiver_slice_zyx(DistanceTensor.squeeze(0),  axis='y', index=98, stride=1)
         quiver_slice_zyx(DistanceTensor2.squeeze(0),  axis='y', index=98, stride=1)
     
 
-    buildPiff(DistanceTensor2, Centers, WallID, ".\\VacuoleAutophagySim\\testCenterFinding\\aioutput050.piff")
-    buildPiff(DistanceTensor2, Centers, WallID, ".\\VacuoleAutophagySim\\testCenterFinding\\aioutput050V2.piff")
-    aiDistanceTensor, _, aiCenters, _,_ = parse_voxel_file_for_distance(".\\VacuoleAutophagySim\\testCenterFinding\\aioutput050.piff")
-    aiDistanceTensor2, vol, aiCenters, WalID,_ = parse_voxel_file_for_distance(".\\VacuoleAutophagySim\\testCenterFinding\\aioutput050V2.piff")
     
 
     #t0 = perf_counter()
@@ -1526,7 +1396,7 @@ def main():
     ap.add_argument("--outdir", type=Path, default=None, help="Output directory (default: alongside each .piff)")
     ap.add_argument("--show", action="store_true", help="Show slices interactively after saving")
     #args = ap.parse_args()
-    piffs = [".\\VacuoleAutophagySim\\testCenterFinding\\output000.piff", ".\\VacuoleAutophagySim\\testCenterFinding\\output050.piff", ".\\VacuoleAutophagySim\\testCenterFinding\\output100.piff", ".\\VacuoleAutophagySim\\testCenterFinding\\output150.piff", ".\\VacuoleAutophagySim\\testCenterFinding\\output200.piff", ".\\VacuoleAutophagySim\\testCenterFinding\\output250.piff", ".\\VacuoleAutophagySim\\testCenterFinding\\output300.piff"]
+    piffs = [".\\VacuoleAutophagySim\\testCenterFinding\\TestCrop.piff"]
 
     process_file(piffs, None, False)
 

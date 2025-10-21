@@ -100,7 +100,7 @@ class ProbHead(nn.Module):
     def forward(self, x):
         # upstream is in mixed precision; force FP32 math here
         with torch.amp.autocast(device_type="cuda", enabled=False):
-            return self.prob_head(x.float()) # cast activations to FP32 for this block
+            return self.prob_head(x) # cast activations to FP32 for this block
         
 
 class DirHead(nn.Module):
@@ -111,7 +111,7 @@ class DirHead(nn.Module):
     def forward(self, x):
         # upstream is in mixed precision; force FP32 math here
         with torch.amp.autocast(device_type="cuda", enabled=False):
-            return self.outc(x.float()) # cast activations to FP32 for this block
+            return self.outc(x) # cast activations to FP32 for this block
 
 class UNet3D(nn.Module):
     def __init__(self, in_channels=9, out_classes=3, features=[16, 32, 64, 128, 256]):
@@ -140,6 +140,8 @@ class UNet3D(nn.Module):
         self.attention1 = SelfAttention3D(features[4])
         self.attention2 = SelfAttention3D(features[4])
         self.attention3 = SelfAttention3D(features[4])
+
+        self.Upattention = SelfAttention3D(features[3])
         # Decoder
         self.up3   = GenUp(features[4], features[3])
         self.up2   = GenUp(features[3], features[2])
@@ -190,6 +192,7 @@ class UNet3D(nn.Module):
         x4 = self.attention3(x4)
 
         x  = self.up3(x4, x3)   # → [B, f2, D/4, H/4, W/4]
+        x = self.Upattention(x)
         x = self.convU3(x)
         x = self.relu(x)
 
