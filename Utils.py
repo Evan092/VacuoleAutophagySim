@@ -840,8 +840,7 @@ def point_vectors_to_centers_nanaware(
     directions: torch.Tensor,
     iters: int = 50,
     step: float = 1.0,
-    mask_thresh: float = 0.99,
-    snap_frequency: int = 10
+    mask_thresh: float = 0.99
 ):
     """
     Follow the flow field to a sink/center from each voxel, respecting NaN 'medium' regions.
@@ -1041,6 +1040,102 @@ def displacements_to_coords(out: torch.Tensor, round_to_int: bool = True):
     coords[nanMask] = torch.nan
     return coords
 
+@torch.no_grad()
+def point_vectors_to_centers_nanaware2(
+    directions: torch.Tensor,
+    iters: int = 50,
+    step: float = 1.0,
+    mask_thresh: float = 0.99,
+    repel: float = 0.0,   # inward push strength (voxels per step)
+):
+    """
+    Follow the flow field to a sink/center from each voxel, respecting NaN 'medium' regions.
+    Adds optional inward push away from NaN regions near boundaries (repel > 0).
+    directions: (3,D,H,W) [dz,dy,dx]; NaNs mark medium/invalid.
+    Returns:    (3,D,H,W) displacement-to-center; NaN at NaN-start voxels.
+    """
+    assert directions.ndim == 4 and directions.shape[0] == 3, "Expected (3,D,H,W)"
+    device, dtype = directions.device, directions.dtype
+    _, D, H, W = directions.shape
+
+    start_valid = torch.isfinite(directions).all(dim=0)  # (D,H,W)
+
+    flow = directions.clone()
+    flow[~torch.isfinite(flow)] = 0
+    mask0 = torch.isfinite(directions).all(dim=0, keepdim=True).to(directions.dtype)  # (1,D,H,W)
+
+    flow = flow.unsqueeze(0)   # (1,3,D,H,W)
+    mask = mask0.unsqueeze(0)  # (1,1,D,H,W)
+
+    # --- Precompute a smooth mask and its spatial gradient for boundary normals ---
+    # smooth (makes gradient well-defined near edges)
+    mask_smooth = torch.nn.functional.avg_pool3d(mask, kernel_size=3, stride=1, padding=1)
+    # central-diff kernels
+    kx = torch.tensor([[-1.0, 0.0, 1.0]], device=device, dtype=dtype).view(1,1,1,1,3)
+    ky = torch.tensor([[-1.0, 0.0, 1.0]], device=device, dtype=dtype).view(1,1,1,3,1)
+    kz = torch.tensor([[-1.0, 0.0, 1.0]], device=device, dtype=dtype).view(1,1,3,1,1)
+    gx = torch.nn.functional.conv3d(mask_smooth, kx, padding=(0,0,1))
+    gy = torch.nn.functional.conv3d(mask_smooth, ky, padding=(0,1,0))
+    gz = torch.nn.functional.conv3d(mask_smooth, kz, padding=(1,0,0))
+    grad_mask = torch.cat([gz, gy, gx], dim=1)  # (1,3,D,H,W) matches [dz,dy,dx] order
+
+    z, y, x = torch.meshgrid(
+        torch.arange(D, device=device, dtype=dtype),
+        torch.arange(H, device=device, dtype=dtype),
+        torch.arange(W, device=device, dtype=dtype),
+        indexing='ij'
+    )
+    base = torch.stack([z, y, x], dim=0)  # (3,D,H,W)
+    pos  = base.clone()
+
+    # Keep NaN-start voxels stationary
+    pos[:, ~start_valid] = base[:, ~start_valid]
+
+    def vox2norm(pz, py, px):
+        gx = 2.0 * px / (W - 1) - 1.0
+        gy = 2.0 * py / (H - 1) - 1.0
+        gz = 2.0 * pz / (D - 1) - 1.0
+        return torch.stack([gx, gy, gz], dim=-1)  # (D,H,W,3)
+
+    eps = torch.finfo(dtype).eps
+
+    for _ in range(iters):
+        grid = vox2norm(pos[0], pos[1], pos[2]).unsqueeze(0)  # (1,D,H,W,3)
+
+        v = torch.nn.functional.grid_sample(
+            flow, grid, mode='bilinear', padding_mode='border', align_corners=True
+        )[0]  # (3,D,H,W)
+
+        w = torch.nn.functional.grid_sample(
+            mask, grid, mode='bilinear', padding_mode='border', align_corners=True
+        )[0, 0]  # (D,H,W)
+
+        move_ok = (w >= mask_thresh) & start_valid
+
+        # Optional inward push away from NaNs (use gradient of mask toward interior)
+        if repel > 0.0:
+            g = torch.nn.functional.grid_sample(
+                grad_mask, grid, mode='bilinear', padding_mode='border', align_corners=True
+            )[0]  # (3,D,H,W)
+            g_norm = g.norm(dim=0).clamp_min(eps)
+            b = repel * (g / g_norm)  # push toward increasing mask (interior)
+        else:
+            b = 0.0
+
+        # Only advance where valid enough; bias only applied where we advance
+        if isinstance(b, float):
+            pos[:, move_ok] = pos[:, move_ok] + step * v[:, move_ok]
+        else:
+            pos[:, move_ok] = pos[:, move_ok] + step * (v[:, move_ok] + b[:, move_ok])
+
+        # Clamp to bounds
+        pos[0].clamp_(0, D - 1)
+        pos[1].clamp_(0, H - 1)
+        pos[2].clamp_(0, W - 1)
+
+    out = pos - base  # (3,D,H,W)
+    out[:, ~start_valid] = torch.nan
+    return out
 
 
 def modelFlowToCenter(gen_outputs: torch.tensor):
@@ -1090,6 +1185,19 @@ def modelFlowToCenter(gen_outputs: torch.tensor):
 
     tmp = snap_vectors_to_nearest_voxel(tmp)
     tmp, mask = sum_with_next_from(tmp, tmp, neighbor_vals=tmp, avoid_self=True, mask=mask)
+    return tmp
+
+
+def modelFlowToCenter2(gen_outputs: torch.tensor, iters=100, step=1, mask_thresh=0, repel=0.2):
+    tmp = gen_outputs[0,:3,:].clone()
+    logits = gen_outputs[0, 3:, ...].clone()          # [3, 200, 200, 200]
+    tmpidx = logits.argmax(dim=0, keepdim=True) # [1, 200, 200, 200]
+    tmp_one_hot = torch.zeros_like(logits).scatter_(0, tmpidx, 1)
+    tmpMask = (tmp_one_hot[2] == 1)
+    tmpMask = tmpMask.repeat(3, 1, 1, 1)
+    tmp[tmpMask] = torch.nan
+    mask=None
+    tmp = point_vectors_to_centers_nanaware2(tmp, iters=iters, step=step, mask_thresh=mask_thresh, repel=repel)
     return tmp
 
 
@@ -1472,6 +1580,67 @@ def condense_single_channel(x: torch.Tensor, channel_dim: int = 0) -> torch.Tens
 
 
 
+import torch
+
+@torch.no_grad()
+def zero_components_toward_adjacent_nans(flow: torch.Tensor) -> torch.Tensor:
+    """
+    flow: (C, 3, D, H, W) in [dz, dy, dx] order.
+    Zero a component if it points toward an adjacent NaN voxel; out-of-bounds counts as NaN.
+    """
+    assert flow.ndim == 5 and flow.shape[1] == 3, "Expected (C,3,D,H,W)"
+    C, _, D, H, W = flow.shape
+
+    out = flow.clone()
+    valid = torch.isfinite(out).all(dim=1)  # (C,D,H,W)
+
+    dz = out[:, 0, ...]
+    dy = out[:, 1, ...]
+    dx = out[:, 2, ...]
+
+    # Neighbor-invalid (True) masks, treating OOB as invalid
+    cur_has_left_nan  = torch.ones_like(valid, dtype=torch.bool)
+    cur_has_right_nan = torch.ones_like(valid, dtype=torch.bool)
+    cur_has_up_nan    = torch.ones_like(valid, dtype=torch.bool)
+    cur_has_down_nan  = torch.ones_like(valid, dtype=torch.bool)
+    cur_has_front_nan = torch.ones_like(valid, dtype=torch.bool)
+    cur_has_back_nan  = torch.ones_like(valid, dtype=torch.bool)
+
+    # x-1 (left): interior depends on neighbor validity
+    cur_has_left_nan[..., :, :, 1:]  = ~valid[..., :, :, :-1]
+    # x+1 (right)
+    cur_has_right_nan[..., :, :, :-1] = ~valid[..., :, :, 1:]
+    # y-1 (up)
+    cur_has_up_nan[..., :, 1:, :]   = ~valid[..., :, :-1, :]
+    # y+1 (down)
+    cur_has_down_nan[..., :, :-1, :] = ~valid[..., :, 1:, :]
+    # z-1 (front)
+    cur_has_front_nan[..., 1:, :, :]  = ~valid[..., :-1, :, :]
+    # z+1 (back)
+    cur_has_back_nan[..., :-1, :, :] = ~valid[..., 1:, :, :]
+
+    # Only modify sites that are valid themselves
+    cur_valid = valid
+
+    mask_dx_zero = ((dx < 0) & cur_has_left_nan)  | ((dx > 0) & cur_has_right_nan)
+    mask_dy_zero = ((dy < 0) & cur_has_up_nan)    | ((dy > 0) & cur_has_down_nan)
+    mask_dz_zero = ((dz < 0) & cur_has_front_nan) | ((dz > 0) & cur_has_back_nan)
+
+    mask_dx_zero &= cur_valid
+    mask_dy_zero &= cur_valid
+    mask_dz_zero &= cur_valid
+
+    dx[mask_dx_zero] = 0
+    dy[mask_dy_zero] = 0
+    dz[mask_dz_zero] = 0
+
+    out[:, 0, ...] = dz
+    out[:, 1, ...] = dy
+    out[:, 2, ...] = dx
+    return out
+
+
+
 
 def parse_voxel_file_for_distance(path, device=torch.device("cpu"), loadExisting=True, saveLoaded=True, parallel=False):
     """
@@ -1568,9 +1737,13 @@ def parse_voxel_file_for_distance(path, device=torch.device("cpu"), loadExisting
 
     flow,tmp2 = masked_gradient3d(smoothedDistance, inward_bias=0)
 
+    flow = flow*-1
+
+    flow = zero_components_toward_adjacent_nans(flow)
+
     flow = condense_single_channel(flow)
 
-    flow = flow * -1
+    #flow = flow * -1
     
     flow[(torch.isnan(flow))] = 0
 

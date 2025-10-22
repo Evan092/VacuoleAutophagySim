@@ -230,7 +230,7 @@ def center_weight_mask(shape=(200,200,200), center=None, sigma=100.0, device='cu
 
 from PIL import Image
 
-def nameTBD(gen_outputs, expectedBodies, savePath):
+def nameTBD(gen_outputs, expectedBodies, savePath=""):
     distToCenter = modelFlowToCenter(gen_outputs)
     coords_idx = displacements_to_coords(distToCenter, round_to_int=True)
     triplets = coords_idx.permute(1, 2, 3, 0)
@@ -255,10 +255,12 @@ def nameTBD(gen_outputs, expectedBodies, savePath):
     ids = cluster_ids_from_coords(final_coords)
     rgb_slice = render_cluster_slice(ids, axis='z', index=100, background='black')
 
-    Image.fromarray(rgb_slice.cpu().numpy()).save(savePath+".png")
-    #plt.imshow(rgb_slice.cpu().numpy())  # rgb_slice is (H,W,3) uint8
-    #plt.axis('off')
-    #plt.show()
+    if savePath != "":
+        Image.fromarray(rgb_slice.cpu().numpy()).save(savePath+".png")
+    else:
+        plt.imshow(rgb_slice.cpu().numpy())  # rgb_slice is (H,W,3) uint8
+        plt.axis('off')
+        plt.show()
 
 
 
@@ -312,7 +314,7 @@ def train(gen_model, disc_model, dataloader,
     printAndLog(f"New sigma: {sigma_sched.value:.4f}")
 
     for index, (volumes, (t1,c1),(t2,c2),(t3,c3),(t4,c4),(t5,c5), steps, path1) in enumerate(dataloader):
-        if False:
+        if True:
 
             folder = "C:\\Users\\evans\\Documents\\Independent Example Tests\\Examples B\\Example" + str(index)
             os.mkdir(folder)

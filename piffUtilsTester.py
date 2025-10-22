@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 from pathlib import Path
+from tkinter import Image
 import numpy as np
-from Utils import oneHotToDistance,smoothDistance, oneHotToDistance_fast,drop_nearby_by_count
+from Utils import *
 import torch
 from time import perf_counter
 import matplotlib.pyplot as plt
@@ -15,6 +16,8 @@ import os
 from scipy.optimize import linear_sum_assignment
 from Utils import buildPiff, parse_voxel_file_for_distance,quiver_slice_zyx
 from Constants import MAX_VOXEL_DIM
+import torch
+from typing import Tuple
 
 CENTER_VALUE = 40  # overlay value for centers
 
@@ -714,9 +717,6 @@ def remove_vectors_pointing_to_nan(
     return flow_out, points_to_nan
 
 
-import torch
-from typing import Tuple
-
 @torch.no_grad()
 def point_direct_to_centers(flow: torch.Tensor,
                             step_mode: str = "nearest",   # "nearest" or "sign"
@@ -1258,15 +1258,103 @@ def vote_gap(rows: torch.Tensor, k: int) -> float:
     v_k1  = vals[k]
     return (v_k - v_k1).item()
 
+
+def modelFlowToCenter(gen_outputs: torch.tensor):
+    tmp = gen_outputs[0,:3,:].clone()
+    logits = gen_outputs[0, 3:, ...].clone()          # [3, 200, 200, 200]
+    tmpidx = logits.argmax(dim=0, keepdim=True) # [1, 200, 200, 200]
+    tmp_one_hot = torch.zeros_like(logits).scatter_(0, tmpidx, 1)
+    tmpMask = (tmp_one_hot[2] == 1)
+    tmpMask = tmpMask.repeat(3, 1, 1, 1)
+    tmp[tmpMask] = torch.nan
+    i=0
+    mask = None
+    ib = 0.08
+    previous_tmp = None
+    prevLast = tmp.shape[1]*tmp.shape[2]*tmp.shape[3]
+    last = prevLast
+    while previous_tmp is None or last<prevLast or last > 1000:
+        previous_tmp = tmp.clone()
+        prevLast=last
+        # Save current state
+        print(str(i))
+
+
+        # Step 1: always sum
+        tmp, mask = sum_with_next_from(tmp, tmp, neighbor_vals=tmp, avoid_self=True, mask=mask)
+
+
+        # Step 2: either snap or bias
+        if (i + 1) % 10 == 0:
+            tmp = snap_vectors_to_nearest_non_nanV3(tmp, search_radius=2, max_chunk_voxels=800_000)
+        elif i==3:
+            tmp = point_vectors_to_centers_nanaware(tmp, iters=100, step=1.0, mask_thresh=0.9)
+        else:
+            tmp = add_inward_bias_to_directions(tmp, inward_bias=ib)
+
+        i += 1
+
+        # Optional: break if it’s spiraling into the tensor abyss
+        if i > 100:
+            print("Max iterations reached.")
+            break
+        if i>30:
+            last = (~(torch.isclose(previous_tmp, tmp, atol=1, equal_nan=True) | torch.isclose(previous_tmp, tmp, rtol=10, equal_nan=True))).float().sum().item()
+            print("Last: ", last)
+        else:
+            last -= 1
+
+    tmp = snap_vectors_to_nearest_voxel(tmp)
+    tmp, mask = sum_with_next_from(tmp, tmp, neighbor_vals=tmp, avoid_self=True, mask=mask)
+    return tmp
+
+
+
+def nameTBD2(distToCenter, expectedBodies, savePath=""):
+    coords_idx = displacements_to_coords(distToCenter, round_to_int=True)
+    triplets = coords_idx.permute(1, 2, 3, 0)
+    triplets = triplets[~torch.isnan(triplets[:,:,:,0]) & ~torch.isnan(triplets[:,:,:,1]) & ~torch.isnan(triplets[:,:,:,2])]
+    triplets = triplets.reshape(-1,3)
+
+    unique_triplets, counts = torch.unique(triplets, dim=0, return_counts=True) # how many map to each voxel
+    
+    result = torch.cat([counts.unsqueeze(1), unique_triplets], dim=1)
+    
+    centers = drop_nearby_by_count(result, radius=2.0, minCount=0)
+    idx = torch.argsort(centers[:, 0], descending=True)
+    centers_sorted = centers[idx]
+    centers_sorted = centers_sorted[:expectedBodies, :]
+
+    final_coords = snap_coords_fast(coords_idx, centers_sorted,
+    r_snap=1,          # radius => includes ±3 in each axis
+    r_neighbor=3,      # radius => includes ±3
+    treat_zero_as_bg=True,
+    interpret="radius")
+
+    ids = cluster_ids_from_coords(final_coords)
+    rgb_slice = render_cluster_slice(ids, axis='y', index=100, background='black')
+
+    if savePath != "":
+        Image.fromarray(rgb_slice.cpu().numpy()).save(savePath+".png")
+    else:
+        plt.imshow(rgb_slice.cpu().numpy())  # rgb_slice is (H,W,3) uint8
+        plt.axis('off')
+        plt.show()
+
+
+
+
 def process_file(piffs, outdir = None, show = False):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     t0 = perf_counter()
-    tensor, aiCenters = parse_voxel_file_for_distance(piffs[0], device)
+    vol, aiCenters = parse_voxel_file_for_distance(piffs[0], device)
     print(f"{perf_counter() - t0:.6f} s")
 
+    flow = modelFlowToCenter(vol.unsqueeze(0))
 
+    nameTBD2 = nameTBD2(flow, len(aiCenters) + 1)
 
     if False:
         quiver_slice_zyx(DistanceTensor.squeeze(0),  axis='y', index=98, stride=1)
@@ -1282,26 +1370,26 @@ def process_file(piffs, outdir = None, show = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vol = vol.to(device)
 
-    t0 = perf_counter()
-    OneChannelDistances3,MultiChannelDistances3 = oneHotToDistance_fast(vol, aiCenters)
-    print(f"{perf_counter() - t0:.6f} s")
+    #t0 = perf_counter()
+    #OneChannelDistances3,MultiChannelDistances3 = oneHotToDistance_fast(vol, aiCenters)
+    #print(f"{perf_counter() - t0:.6f} s")
 
     #t0 = perf_counter()
     #OneChannelDistances,MultiChannelDistances = oneHotToDistance(vol, aiCenters)
     #print(f"{perf_counter() - t0:.6f} s")
 
-    smoothedDistance = smoothDistance(MultiChannelDistances3)
+    #smoothedDistance = smoothDistance(MultiChannelDistances3)
 
-    tmp1,tmp2 = masked_gradient3d(smoothedDistance, inward_bias=-1.25)
+    #tmp1,tmp2 = masked_gradient3d(smoothedDistance, inward_bias=-1.25)
 
-    smoothedDistance = condense_single_channel(tmp1)
+    #smoothedDistance = condense_single_channel(tmp1)
 
-    smoothedDistance = smoothedDistance * -1
+    #smoothedDistance = smoothedDistance * -1
 
     #t,_ = point_direct_to_centers(smoothedDistance, step_mode="sign")
 
 
-    tmp = smoothedDistance.clone()
+    #tmp = smoothedDistance.clone()
     #quiver_slice_zyx(tmp,  axis='y', index=98, stride=1, savePath="C:\\Users\\evans\\tmp\\Addedv0.png" )
     
     mask = None
@@ -1317,7 +1405,7 @@ def process_file(piffs, outdir = None, show = False):
         print(mask[(mask<100) & (mask>0)].shape)
         #quiver_slice_zyx(tmp,  axis='z', index=98, stride=1, savePath="C:\\Users\\evans\\tmp\\Addedv"+str(i+1)+".png" )
 
-    tmp = snap_vectors_to_nearest_non_nan(tmp,search_radius=9)
+    tmp = snap_vectors_to_nearest_non_nanV3(tmp,search_radius=9)
     #tmp, _ = remove_vectors_pointing_to_nan(tmp,tmp,torch.nan)
 
     mask = None
@@ -1333,7 +1421,7 @@ def process_file(piffs, outdir = None, show = False):
         print(mask[(mask<100) & (mask>0)].shape)
 
 
-    tmp = snap_vectors_to_nearest_non_nan(tmp,search_radius=9)
+    tmp = snap_vectors_to_nearest_non_nanV3(tmp,search_radius=9)
     
     mask = None
     while mask == None or len(mask[(mask<100) & (mask>0)]) > 0:
@@ -1350,7 +1438,7 @@ def process_file(piffs, outdir = None, show = False):
 
     #tmp, _ = remove_vectors_pointing_to_nan(tmp,tmp,torch.nan)
 
-    tmp = snap_vectors_to_nearest_non_nan(tmp)
+    tmp = snap_vectors_to_nearest_non_nanV3(tmp)
 
 
     coords_idx = displacements_to_coords(tmp, round_to_int=True)
@@ -1396,7 +1484,7 @@ def main():
     ap.add_argument("--outdir", type=Path, default=None, help="Output directory (default: alongside each .piff)")
     ap.add_argument("--show", action="store_true", help="Show slices interactively after saving")
     #args = ap.parse_args()
-    piffs = [".\\VacuoleAutophagySim\\testCenterFinding\\TestCrop.piff"]
+    piffs = [".\\VacuoleAutophagySim\\testCenterFinding\\output300.piff"]
 
     process_file(piffs, None, False)
 
