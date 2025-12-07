@@ -9,29 +9,71 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import torch
+import torch.nn as nn
+from torch.cuda.amp import autocast
+import math
+
+import torch
+import torch.nn as nn
+import math
+from torch.cuda.amp import autocast  # use this, not torch.amp.autocast on older torch
+
 class SelfAttention3D(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
-        # project to lower‐dim Q/K/V
         self.query_conv = nn.Conv3d(in_channels, in_channels // 8, kernel_size=1)
         self.key_conv   = nn.Conv3d(in_channels, in_channels // 8, kernel_size=1)
         self.value_conv = nn.Conv3d(in_channels, in_channels,      kernel_size=1)
-        self.gamma      = nn.Parameter(torch.zeros(1))  # learnable residual scale
+        self.gamma      = nn.Parameter(torch.zeros(1))
+
+        self.scale = 1.0 / math.sqrt(max(in_channels // 8, 1))
 
     def forward(self, x):
         B, C, D, H, W = x.shape
-        # compute Q, K, V
-        q = self.query_conv(x).view(B, -1, D*H*W)      # B × C’ × N
-        k = self.key_conv(x).view(B, -1, D*H*W)        # B × C’ × N
-        v = self.value_conv(x).view(B,  C, D*H*W)      # B × C  × N
+        N = D * H * W
 
-        # attention map (B × N × N)
-        attn = torch.softmax(q.permute(0,2,1) @ k, dim=-1)
+        assert torch.isfinite(x).all(), "x has NaN/Inf before attention"
 
-        # aggregate V
-        out = (v @ attn).view(B, C, D, H, W)           # B × C × D × H × W
+        q = self.query_conv(x).view(B, -1, N)  # [B, C', N]
+        k = self.key_conv(x).view(B, -1, N)    # [B, C', N]
+        v = self.value_conv(x).view(B,  C, N)  # [B, C,  N]
 
-        return self.gamma * out + x
+        assert torch.isfinite(q).all(), "q blew up"
+        assert torch.isfinite(k).all(), "k blew up"
+        assert torch.isfinite(v).all(), "v blew up"
+
+        with torch.amp.autocast('cuda', enabled=False):
+            q32 = q.float()
+            k32 = k.float()
+            v32 = v.float()
+
+            assert torch.isfinite(q32).all(), "q32 blew up"
+            assert torch.isfinite(k32).all(), "k32 blew up"
+            assert torch.isfinite(v32).all(), "v32 blew up"
+
+            logits = (q32.transpose(1, 2) @ k32) * self.scale  # [B, N, N]
+            assert torch.isfinite(logits).all(), "logits blew up before clamp"
+
+            logits = torch.clamp(logits, min=-80.0, max=80.0)
+            assert torch.isfinite(logits).all(), "logits blew up after clamp"
+
+            attn32 = torch.softmax(logits, dim=-1)  # [B, N, N]
+            assert torch.isfinite(attn32).all(), "attn32 blew up after softmax"
+
+            out32 = v32 @ attn32  # [B, C, N]
+            assert torch.isfinite(out32).all(), "out32 blew up after v @ attn"
+
+        out = out32.view(B, C, D, H, W).to(x.dtype)
+        assert torch.isfinite(out).all(), "out (reshaped) blew up"
+
+        final = self.gamma * out + x
+        assert torch.isfinite(final).all(), "final residual blew up"
+
+        return final
+
+
+
 
 
 
@@ -43,11 +85,11 @@ class DoubleConv(nn.Module):
         self.double_conv = nn.Sequential(
             nn.Conv3d(in_ch,  out_ch, kernel_size=3, padding=1, bias=False),
             #nn.BatchNorm3d(out_ch),
-            nn.GroupNorm(num_groups=8, num_channels=out_ch),
+            GroupNormFP32(num_groups=8, num_channels=out_ch),
             nn.ReLU(inplace=False),
             nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
             #nn.BatchNorm3d(out_ch),
-            nn.GroupNorm(num_groups=8, num_channels=out_ch),
+            GroupNormFP32(num_groups=8, num_channels=out_ch),
             nn.ReLU(inplace=False),
         )
     def forward(self, x):
@@ -90,9 +132,9 @@ class ProbHead(nn.Module):
         super().__init__()
         self.prob_head = nn.Sequential(
             nn.Conv3d(features[0], features[1], 1, bias=False),             # 16 → 32 (cheap)
-            nn.GroupNorm(4, features[1]), nn.LeakyReLU(inplace=True),
+            GroupNormFP32(4, features[1]), nn.LeakyReLU(inplace=True),
             nn.Conv3d(features[1], features[2], 3, padding=1, bias=False),  # 32 → 64
-            nn.GroupNorm(8, features[2]), nn.LeakyReLU(inplace=True),
+            GroupNormFP32(8, features[2]), nn.LeakyReLU(inplace=True),
             nn.Dropout3d(0.1),
             nn.Conv3d(features[2], out_classes, 1, bias=True)
         )             # your conv/gn/relu/... stack
@@ -101,6 +143,15 @@ class ProbHead(nn.Module):
         # upstream is in mixed precision; force FP32 math here
         with torch.amp.autocast(device_type="cuda", enabled=False):
             return self.prob_head(x) # cast activations to FP32 for this block
+        
+
+
+class GroupNormFP32(nn.GroupNorm):
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # Temporarily disable AMP autocasting
+        with torch.amp.autocast(device_type="cuda", enabled=True):
+            # Convert input to float32 to ensure stable stats and normalization
+            return super().forward(input.float())
         
 
 class DirHead(nn.Module):
@@ -120,12 +171,12 @@ class UNet3D(nn.Module):
         self.noise_proj = nn.Sequential(
             # 1→4
             nn.ConvTranspose3d(noise_dim, 8, kernel_size=4, stride=4),
-            nn.GroupNorm(num_groups=8, num_channels=8),
+            GroupNormFP32(num_groups=8, num_channels=8),
             nn.ReLU(inplace=False),
 
             # 4→200  (3*50 + 50 = 200)
             nn.ConvTranspose3d(8, 2, kernel_size=50, stride=50),
-            nn.GroupNorm(num_groups=2, num_channels=2),
+            GroupNormFP32(num_groups=2, num_channels=2),
             nn.ReLU(inplace=False),
         )
 

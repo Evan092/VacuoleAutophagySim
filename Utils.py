@@ -1041,7 +1041,7 @@ def displacements_to_coords(out: torch.Tensor, round_to_int: bool = True):
     return coords
 
 @torch.no_grad()
-def point_vectors_to_centers_nanaware2(
+def point_vectors_to_centers_nanaware2Old(
     directions: torch.Tensor,
     iters: int = 50,
     step: float = 1.0,
@@ -1138,7 +1138,129 @@ def point_vectors_to_centers_nanaware2(
     return out
 
 
-def modelFlowToCenter(gen_outputs: torch.tensor):
+@torch.no_grad()
+def point_vectors_to_centers_nanaware2(
+    directions: torch.Tensor,
+    iters: int = 50,
+    step: float = 1.0,
+    mask_thresh: float = 0.99,
+    repel: float = 0.0,   # inward push strength (voxels per step)
+    min_delta: float = 1e-3,  # stop early if max movement < this
+):
+    """
+    Follow the flow field to a sink/center from each voxel, respecting NaN 'medium' regions.
+    Adds optional inward push away from NaN regions near boundaries (repel > 0).
+    directions: (3,D,H,W) [dz,dy,dx]; NaNs mark medium/invalid.
+    Returns:    (3,D,H,W) displacement-to-center; NaN at NaN-start voxels.
+    """
+    assert directions.ndim == 4 and directions.shape[0] == 3, "Expected (3,D,H,W)"
+    device, dtype = directions.device, directions.dtype
+    _, D, H, W = directions.shape
+
+    start_valid = torch.isfinite(directions).all(dim=0)  # (D,H,W)
+
+    flow = directions.clone()
+    flow[~torch.isfinite(flow)] = 0
+    mask0 = torch.isfinite(directions).all(dim=0, keepdim=True).to(directions.dtype)  # (1,D,H,W)
+
+    flow = flow.unsqueeze(0)   # (1,3,D,H,W)
+    mask = mask0.unsqueeze(0)  # (1,1,D,H,W)
+
+    # --- Precompute a smooth mask and its spatial gradient for boundary normals ---
+    mask_smooth = torch.nn.functional.avg_pool3d(mask, kernel_size=3, stride=1, padding=1)
+
+    kx = torch.tensor([[-1.0, 0.0, 1.0]], device=device, dtype=dtype).view(1,1,1,1,3)
+    ky = torch.tensor([[-1.0, 0.0, 1.0]], device=device, dtype=dtype).view(1,1,1,3,1)
+    kz = torch.tensor([[-1.0, 0.0, 1.0]], device=device, dtype=dtype).view(1,1,3,1,1)
+
+    gx = torch.nn.functional.conv3d(mask_smooth, kx, padding=(0,0,1))
+    gy = torch.nn.functional.conv3d(mask_smooth, ky, padding=(0,1,0))
+    gz = torch.nn.functional.conv3d(mask_smooth, kz, padding=(1,0,0))
+
+    grad_mask = torch.cat([gz, gy, gx], dim=1)  # (1,3,D,H,W) matches [dz,dy,dx] order
+
+    z, y, x = torch.meshgrid(
+        torch.arange(D, device=device, dtype=dtype),
+        torch.arange(H, device=device, dtype=dtype),
+        torch.arange(W, device=device, dtype=dtype),
+        indexing='ij'
+    )
+    base = torch.stack([z, y, x], dim=0)  # (3,D,H,W)
+    pos  = base.clone()
+
+    # Keep NaN-start voxels stationary
+    pos[:, ~start_valid] = base[:, ~start_valid]
+
+    def vox2norm(pz, py, px):
+        gx = 2.0 * px / (W - 1) - 1.0
+        gy = 2.0 * py / (H - 1) - 1.0
+        gz = 2.0 * pz / (D - 1) - 1.0
+        return torch.stack([gx, gy, gz], dim=-1)  # (D,H,W,3)
+
+    eps = torch.finfo(dtype).eps
+
+    for _ in range(iters):
+        # save old position so we can measure movement
+        pos_before = pos.clone()
+
+        grid = vox2norm(pos[0], pos[1], pos[2]).unsqueeze(0)  # (1,D,H,W,3)
+
+        v = torch.nn.functional.grid_sample(
+            flow, grid, mode='bilinear', padding_mode='border', align_corners=True
+        )[0]  # (3,D,H,W)
+
+        w = torch.nn.functional.grid_sample(
+            mask, grid, mode='bilinear', padding_mode='border', align_corners=True
+        )[0, 0]  # (D,H,W)
+
+        move_ok = (w >= mask_thresh) & start_valid
+
+        # Optional inward push away from NaNs
+        if repel > 0.0:
+            g = torch.nn.functional.grid_sample(
+                grad_mask, grid, mode='bilinear', padding_mode='border', align_corners=True
+            )[0]  # (3,D,H,W)
+            g_norm = g.norm(dim=0).clamp_min(eps)
+            b = repel * (g / g_norm)  # push toward increasing mask (interior)
+        else:
+            b = 0.0
+
+        # Only advance where valid enough; bias only applied where we advance
+        if isinstance(b, float):
+            pos[:, move_ok] = pos[:, move_ok] + step * v[:, move_ok]
+        else:
+            pos[:, move_ok] = pos[:, move_ok] + step * (v[:, move_ok] + b[:, move_ok])
+
+        # Clamp to bounds
+        pos[0].clamp_(0, D - 1)
+        pos[1].clamp_(0, H - 1)
+        pos[2].clamp_(0, W - 1)
+
+        # --- early stop check ---
+        # displacement this step
+        delta = pos - pos_before  # (3,D,H,W)
+
+        # per-voxel movement magnitude
+        delta_mag = torch.sqrt(delta[0] * delta[0] +
+                               delta[1] * delta[1] +
+                               delta[2] * delta[2])  # (D,H,W)
+
+        # only consider voxels that we actually tried to move (move_ok)
+        # if no voxel moved_ok at all, we're definitely done
+        if move_ok.any():
+            max_move = delta_mag[move_ok].max()
+            # stop if even the max move is tiny
+            if max_move < min_delta:
+                break
+        else:
+            break
+
+    out = pos - base  # (3,D,H,W)
+    out[:, ~start_valid] = torch.nan
+    return out
+
+
+def modelFlowToCenterOld(gen_outputs: torch.tensor):
     tmp = gen_outputs[0,:3,:].clone()
     logits = gen_outputs[0, 3:, ...].clone()          # [3, 200, 200, 200]
     tmpidx = logits.argmax(dim=0, keepdim=True) # [1, 200, 200, 200]
@@ -1188,7 +1310,7 @@ def modelFlowToCenter(gen_outputs: torch.tensor):
     return tmp
 
 
-def modelFlowToCenter2(gen_outputs: torch.tensor, iters=100, step=1, mask_thresh=0, repel=0.2):
+def modelFlowToCenter(gen_outputs: torch.tensor, iters=100, step=1, mask_thresh=0, repel=0.2):
     tmp = gen_outputs[0,:3,:].clone()
     logits = gen_outputs[0, 3:, ...].clone()          # [3, 200, 200, 200]
     tmpidx = logits.argmax(dim=0, keepdim=True) # [1, 200, 200, 200]
@@ -1640,6 +1762,87 @@ def zero_components_toward_adjacent_nans(flow: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def loadData(paths, device, flips_batch):
+    """
+    paths:        iterable of length B
+                  each element is something indexable like paths[b][0] == actual file path string
+                  (mirroring your old usage of path[0])
+    flips_batch:  iterable of length B
+                  each element is the flips list for that sample, e.g. [] or [1,3] etc.
+
+    returns:
+      targetTensor_batch: torch.Tensor [B, 6, D, H, W]  (float32, NOT half)
+      centers_batch:      list of length B, each (Ni,4) tensor (int or float)
+      vol_batch:          torch.Tensor [B, D, H, W]     (uint8/int16/float32 depending on parse)
+    """
+
+    batch_target_list = []
+    batch_vol_list    = []
+    batch_centers_list = []
+
+    for b, single_path in enumerate(paths):
+        # match your original "path[0]" behavior
+        # if each 'single_path' is already a string, use it directly.
+        # if it's like (p,) or [p], grab [0]
+        if isinstance(single_path, (list, tuple)):
+            voxel_path = single_path[0]
+        else:
+            voxel_path = single_path
+
+        # parse one sample
+        targetTensor1, vol1, centers1 = parse_voxel_file_for_distance(voxel_path, device=device)
+
+        # flips for this sample
+        flips = flips_batch[b]
+        # axis sign flips for direction channels and center coords
+        if 1 in flips:
+            # flip z-component sign
+            targetTensor1[0] = targetTensor1[0] * -1
+            centers1[:, 1]   = MAX_VOXEL_DIM - centers1[:, 1]
+        if 2 in flips:
+            # flip y-component sign
+            targetTensor1[1] = targetTensor1[1] * -1
+            centers1[:, 2]   = MAX_VOXEL_DIM - centers1[:, 2]
+        if 3 in flips:
+            # flip x-component sign
+            targetTensor1[2] = targetTensor1[2] * -1
+            centers1[:, 3]   = MAX_VOXEL_DIM - centers1[:, 3]
+
+        # spatial flips
+        # torch.flip expects dims as a list/tuple of dimension indices.
+        # your flips is [1,2,3] etc. You were passing that directly before,
+        # so we keep that behavior.
+        targetTensor1 = torch.flip(targetTensor1, dims=flips[flips != 0].tolist())
+        vol1          = torch.flip(vol1,          dims=flips[flips != 0].tolist())
+
+        # add batch dim so it becomes [1,6,D,H,W]
+        targetTensor1 = targetTensor1.unsqueeze(0)
+        # vol1 is [D,H,W] in your old code, or [1,D,H,W] depending on parse.
+        # You were not unsqueezing vol1 before return, and later you ran:
+        #   vol_full = vol_full.to(device, ...)
+        #   modelVol = modelVol.unsqueeze(0)
+        # and compared shapes.
+        # We want vol_batch to become [B,D,H,W] in the final stack.
+        # So ensure vol1 is [1,D,H,W] here for consistent stacking.
+        if vol1.dim() == 3:
+            vol1 = vol1.unsqueeze(0)  # now [1,D,H,W]
+
+        # centers1 can have variable length per sample (Ni x 4),
+        # so we CANNOT stack them safely across batch.
+        # We'll just append raw and return a python list.
+        batch_target_list.append(targetTensor1)  # [1,6,D,H,W]
+        batch_vol_list.append(vol1)              # [1,D,H,W]
+        batch_centers_list.append(centers1)      # [Ni,4]
+
+    # cat along batch dim
+    targetTensor_batch = torch.cat(batch_target_list, dim=0).to(device, non_blocking=True)
+    vol_batch          = torch.cat(batch_vol_list,    dim=0).to(device, non_blocking=True)
+
+    # centers stays as a list (variable lengths)
+    # Move each to device for you to avoid .to() later:
+    centers_batch = [c.to(device, non_blocking=True) for c in batch_centers_list]
+
+    return targetTensor_batch, centers_batch[0], vol_batch
 
 
 def parse_voxel_file_for_distance(path, device=torch.device("cpu"), loadExisting=True, saveLoaded=True, parallel=False):
@@ -1660,6 +1863,7 @@ def parse_voxel_file_for_distance(path, device=torch.device("cpu"), loadExisting
             bodyMask = tensor["bodyMask"]
             wallMask = tensor["wallMask"]
             mediumMask = tensor["mediumMask"]
+            vol = tensor["vol"]
         except RuntimeError as e:
             if "PytorchStreamReader failed reading zip archive" in str(e):
                 print(f"[!] Corrupted file detected: {path}, deleting and rebuilding...")
@@ -1669,7 +1873,7 @@ def parse_voxel_file_for_distance(path, device=torch.device("cpu"), loadExisting
                     print(f"   Failed to delete {os.path.join(str(path).removesuffix(".piff") + "quickload.pt")}: {rm_err}")
                     return parse_voxel_file_for_distance(path, loadExisting, saveLoaded)
                 return parse_voxel_file_for_distance(path, loadExisting, saveLoaded)
-        return torch.cat([flow, bodyMask, wallMask,mediumMask], dim=0), centers.squeeze(0) #, centers, wallID, wallMask
+        return torch.cat([flow, bodyMask, wallMask,mediumMask], dim=0), vol, centers.squeeze(0) #, centers, wallID, wallMask
 
 
 
@@ -1728,10 +1932,7 @@ def parse_voxel_file_for_distance(path, device=torch.device("cpu"), loadExisting
     mediumMask = mediumMask.to(device)
     centers = torch.tensor(centers, dtype=torch.float16, device=device)
 
-    OneChannelDistances3,MultiChannelDistances3 = oneHotToDistance_fast(vol, centers)
-
-    vol=None # RELEASE RESOURCES
-    tensor = None
+    _,MultiChannelDistances3 = oneHotToDistance_fast(vol, centers)
 
     smoothedDistance = smoothDistance(MultiChannelDistances3)
 
@@ -1780,12 +1981,13 @@ def parse_voxel_file_for_distance(path, device=torch.device("cpu"), loadExisting
             "flow": flow,
             "bodyMask": bodyMask,
             "wallMask": wallMask,
-            "mediumMask": mediumMask
+            "mediumMask": mediumMask,
+            "vol": vol
         },
         os.path.join(str(path).removesuffix(".piff") + "quickLoad.pt")
         )
 
-    return torch.cat([flow, bodyMask, wallMask,mediumMask], dim=0), centers.squeeze(0) #, centers, wallID, wallMask
+    return torch.cat([flow, bodyMask, wallMask,mediumMask], dim=0), vol, centers.squeeze(0) #, centers, wallID, wallMask
 
 def drop_nearby_by_count(result: torch.Tensor, radius: float = 3.0, metric: str = "euclidean", minCount = 0):
     """
@@ -2730,3 +2932,468 @@ def buildPiff(NewDistanceTensor: torch.Tensor,
     return df
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn.functional as F
+
+
+import torch
+
+def hungarian_match_coordinates(newCenters: torch.Tensor, oldCenters: torch.Tensor) -> torch.Tensor:
+    """
+    newCenters: (M, 4) -> [voteCount, z, y, x]
+    oldCenters:             (N, 4) -> [ID,        z, y, x]
+
+    Returns:
+      matches: (K, 4) tensor where each row is
+               [ID_from_oldCenters, z_from_newCenters, y_from_newCenters, x_from_newCenters]
+      with K = min(N, M). Uses Hungarian (optimal) matching by Euclidean distance in (z,y,x).
+    """
+    # lazy import to avoid hard dependency if unused elsewhere
+    try:
+        from scipy.optimize import linear_sum_assignment
+    except ImportError as e:
+        raise ImportError("scipy is required for Hungarian matching. Install with `pip install scipy`.") from e
+
+    assert newCenters.ndim == 2 and newCenters.shape[1] == 4
+    assert oldCenters.ndim == 2 and oldCenters.shape[1] == 4
+
+    device = newCenters.device
+    dtype  = newCenters.dtype
+
+    # Extract coords
+    C = newCenters[:, 1:4].to(dtype)   # (M,3)
+    P = oldCenters[:, 1:4].to(dtype)               # (N,3)
+
+    N = P.shape[0]
+    M = C.shape[0]
+
+    # Cost matrix: squared Euclidean distances (NxM)
+    # (broadcasted) ||P_i - C_j||^2
+    P_exp = P[:, None, :]                  # (N,1,3)
+    C_exp = C[None, :, :]                  # (1,M,3)
+    cost = ((P_exp - C_exp) ** 2).sum(dim=2)  # (N,M)
+
+    # Hungarian assignment (works for rectangular matrices; returns min(N,M) pairs)
+    row_ind, col_ind = linear_sum_assignment(cost.cpu().numpy())
+
+    # Build output
+    ids = oldCenters[row_ind, 0].to(dtype).to(device)       # (K,)
+    matched_centers = newCenters[col_ind, 1:4].to(dtype).to(device)  # (K,3)
+    out = torch.cat([ids.unsqueeze(1), matched_centers], dim=1)          # (K,4)
+    return out
+
+
+
+import torch
+import torch.nn.functional as F
+
+def _valid_ids(L: torch.Tensor) -> torch.Tensor:
+    """
+    Return sorted unique IDs in L, excluding NaN and -1.
+    Works on older torch (no union1d/intersect1d/etc).
+    """
+    m = ~torch.isnan(L)
+    if not m.any():
+        return torch.empty(0, device=L.device, dtype=L.dtype)
+
+    ids = torch.unique(L[m])
+    ids = ids[ids != -1]
+    # sort
+    ids = torch.sort(ids).values
+    return ids
+
+
+def _union_ids(ids1: torch.Tensor, ids2: torch.Tensor) -> torch.Tensor:
+    """
+    Manual union of two 1D tensors of IDs.
+    """
+    if ids1.numel() == 0 and ids2.numel() == 0:
+        return torch.empty(0, device=ids1.device if ids1.numel() else ids2.device, dtype=ids1.dtype if ids1.numel() else ids2.dtype)
+    both = torch.cat([ids1, ids2])  # (N1+N2,)
+    uniq = torch.unique(both)
+    uniq = torch.sort(uniq).values
+    return uniq
+
+
+def _in_tensor(val: torch.Tensor, arr: torch.Tensor) -> bool:
+    """
+    Check whether scalar tensor val is present anywhere in 1D tensor arr.
+    """
+    return bool((arr == val).any().item())
+
+
+def volume_similarity_percent(labels1: torch.Tensor, labels2: torch.Tensor) -> torch.Tensor:
+    """
+    For each batch b:
+      For each ID in UNION(labels1[b].IDs, labels2[b].IDs), excluding -1/NaN:
+        v1 = voxel count of that ID in labels1[b] (0 if missing)
+        v2 = voxel count of that ID in labels2[b] (0 if missing)
+
+        score_id =
+          min(v1,v2)/max(v1,v2) if both >0
+          0                     if only one >0
+
+      sims[b] = 100 * mean(score_id over union)
+      If union empty => NaN
+    """
+    assert labels1.shape == labels2.shape and labels1.ndim == 4, "labels must both be (B,Z,Y,X) and same shape"
+    device = labels1.device
+    B = labels1.shape[0]
+    sims = torch.full((B,), float('nan'), device=device, dtype=torch.float32)
+
+    for b in range(B):
+        L1 = labels1[b]
+        L2 = labels2[b]
+
+        # get IDs + counts (excluding NaN/-1)
+        if (~torch.isnan(L1)).any():
+            ids1_all, cnt1_all = torch.unique(L1[~torch.isnan(L1)], return_counts=True)
+            keep1 = (ids1_all != -1)
+            ids1_all = ids1_all[keep1]
+            cnt1_all = cnt1_all[keep1]
+        else:
+            ids1_all = torch.empty(0, device=device, dtype=L1.dtype)
+            cnt1_all = torch.empty(0, device=device, dtype=torch.long)
+
+        if (~torch.isnan(L2)).any():
+            ids2_all, cnt2_all = torch.unique(L2[~torch.isnan(L2)], return_counts=True)
+            keep2 = (ids2_all != -1)
+            ids2_all = ids2_all[keep2]
+            cnt2_all = cnt2_all[keep2]
+        else:
+            ids2_all = torch.empty(0, device=device, dtype=L2.dtype)
+            cnt2_all = torch.empty(0, device=device, dtype=torch.long)
+
+        # union of IDs
+        union_ids = _union_ids(torch.sort(ids1_all).values, torch.sort(ids2_all).values)
+
+        if union_ids.numel() == 0:
+            sims[b] = float('nan')
+            continue
+
+        per_id_scores = []
+        for cid in union_ids:
+            # volume in labels1
+            mask1 = (ids1_all == cid)
+            if mask1.any():
+                v1 = cnt1_all[mask1][0].to(torch.float32)
+            else:
+                v1 = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+            # volume in labels2
+            mask2 = (ids2_all == cid)
+            if mask2.any():
+                v2 = cnt2_all[mask2][0].to(torch.float32)
+            else:
+                v2 = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+            if v1 > 0 and v2 > 0:
+                mn = torch.minimum(v1, v2)
+                mx = torch.maximum(v1, v2)
+                score_id = mn / mx
+            elif (v1 > 0) ^ (v2 > 0):
+                score_id = torch.tensor(0.0, device=device, dtype=torch.float32)
+            else:
+                # both zero shouldn't really happen for a union ID, but define 0
+                score_id = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+            per_id_scores.append(score_id)
+
+        per_id_scores = torch.stack(per_id_scores)
+        sims[b] = 100.0 * per_id_scores.mean()
+
+    return sims
+
+
+def aspect_similarity_percent(labels1: torch.Tensor, labels2: torch.Tensor, isAMP = False) -> torch.Tensor:
+    """
+    For each batch b:
+      Let a(id) = sqrt(lmax/lmin) of covariance of that body's voxel coords.
+      For each ID in UNION(labels1[b].IDs, labels2[b].IDs), excluding -1/NaN:
+
+        If ID exists in both:
+            if both aspects finite:
+                score_id = min(a1,a2)/max(a1,a2)
+            else:
+                score_id = 0
+        Else:
+            score_id = 0
+
+      sims[b] = 100 * mean(score_id over union)
+      If union empty => NaN
+    """
+    assert labels1.shape == labels2.shape and labels1.ndim == 4, "labels must both be (B,Z,Y,X)"
+    device = labels1.device
+    B, Z, Y, X = labels1.shape
+    sims = torch.full((B,), float('nan'), device=device, dtype=torch.float32)
+
+    # coordinate grid
+    zz = torch.arange(Z, device=device, dtype=torch.float32)
+    yy = torch.arange(Y, device=device, dtype=torch.float32)
+    xx = torch.arange(X, device=device, dtype=torch.float32)
+    Zg, Yg, Xg = torch.meshgrid(zz, yy, xx, indexing='ij')  # (Z,Y,X)
+
+    def body_aspect(L, bid, isAMP):
+        m = (L == bid)
+        n = int(m.sum().item())
+        if n < 2:
+            return torch.tensor(float('nan'), device=device, dtype=torch.float32)
+
+        zc = Zg[m]
+        yc = Yg[m]
+        xc = Xg[m]
+        coords = torch.stack([zc, yc, xc], dim=1)  # (N,3)
+
+        X0 = coords - coords.mean(dim=0, keepdim=True)
+
+        with torch.amp.autocast(device_type='cuda', enabled=isAMP):
+            C = (X0.T @ X0) / n  # 3x3
+        
+        evals = torch.linalg.eigvalsh(C)  # ascending
+        lmin = torch.clamp(evals[0], min=1e-12)
+        lmax = torch.clamp(evals[-1], min=1e-12)
+        return torch.sqrt(lmax / lmin)
+
+    for b in range(B):
+        L1 = labels1[b]
+        L2 = labels2[b]
+
+        ids1 = _valid_ids(L1)
+        ids2 = _valid_ids(L2)
+
+        union_ids = _union_ids(ids1, ids2)
+
+        if union_ids.numel() == 0:
+            sims[b] = float('nan')
+            continue
+
+        per_id_scores = []
+        for cid in union_ids:
+            in1 = _in_tensor(cid, ids1)
+            in2 = _in_tensor(cid, ids2)
+
+            if in1 and in2:
+                a1 = body_aspect(L1, cid, isAMP)
+                a2 = body_aspect(L2, cid, isAMP)
+
+                if torch.isfinite(a1) and torch.isfinite(a2):
+                    mn = torch.minimum(a1, a2)
+                    mx = torch.maximum(a1, a2)
+                    score_id = mn / mx
+                else:
+                    score_id = torch.tensor(0.0, device=device, dtype=torch.float32)
+            else:
+                score_id = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+            per_id_scores.append(score_id)
+
+        per_id_scores = torch.stack(per_id_scores)
+        sims[b] = 100.0 * per_id_scores.mean()
+
+    return sims
+
+
+def border_touch_similarity_percent(labels1: torch.Tensor, labels2: torch.Tensor) -> torch.Tensor:
+    """
+    For each batch b:
+      p(id) = fraction of that body's border voxels that touch a *different* body (6-neighborhood).
+      For each ID in UNION(labels1[b].IDs, labels2[b].IDs), excluding -1/NaN:
+
+        If ID exists in both:
+            if both finite:
+                score_id = min(p1,p2)/max(p1,p2)
+            else:
+                score_id = 0
+        Else:
+            score_id = 0
+
+      sims[b] = 100 * mean(score_id over union)
+      If union empty => NaN
+    """
+    assert labels1.shape == labels2.shape and labels1.ndim == 4, "labels must both be (B,Z,Y,X)"
+    device = labels1.device
+    B, Z, Y, X = labels1.shape
+    sims = torch.full((B,), float('nan'), device=device, dtype=torch.float32)
+
+    def pad_nan(t, pad, dim):
+        # pads for F.pad are (Wl,Wr, Yl,Yr, Zl,Zr)
+        pads = [0,0,0,0,0,0]
+        pads[2*(2-dim)+0] = pad[0]
+        pads[2*(2-dim)+1] = pad[1]
+        return F.pad(t, pads, mode='constant', value=float('nan'))
+
+    def per_id_border_fraction(L):
+        center_mask = ~torch.isnan(L)
+        if not center_mask.any():
+            return (torch.empty(0, device=device, dtype=torch.float32),
+                    torch.empty(0, device=device, dtype=torch.float32))
+
+        nlist = []
+        nlist.append(pad_nan(L[0:Z-1, :, :], (1,0), dim=0))  # z-1
+        nlist.append(pad_nan(L[1:Z,   :, :], (0,1), dim=0))  # z+1
+        nlist.append(pad_nan(L[:, 0:Y-1, :], (1,0), dim=1))  # y-1
+        nlist.append(pad_nan(L[:, 1:Y,   :], (0,1), dim=1))  # y+1
+        nlist.append(pad_nan(L[:, :, 0:X-1], (1,0), dim=2))  # x-1
+        nlist.append(pad_nan(L[:, :, 1:X],   (0,1), dim=2))  # x+1
+
+        neigh = torch.stack(nlist, dim=0)  # (6,Z,Y,X)
+
+        is_other = (~torch.isnan(neigh)) & (neigh != L.unsqueeze(0))
+        is_bg    = torch.isnan(neigh)
+
+        border_any   = torch.any(is_bg | is_other, dim=0) & center_mask
+        border_other = torch.any(is_other,          dim=0) & center_mask
+
+        ids = torch.unique(L[center_mask])
+        frac = torch.empty_like(ids, dtype=torch.float32)
+        for i, bid in enumerate(ids):
+            m  = (L == bid)
+            ba = (border_any & m).sum()
+            bo = (border_other & m).sum()
+            if ba.item() > 0:
+                frac[i] = (bo.to(torch.float32) / ba.to(torch.float32))
+            else:
+                frac[i] = torch.tensor(0.0, device=device, dtype=torch.float32)
+        return ids, frac
+
+    for b in range(B):
+        L1 = labels1[b]
+        L2 = labels2[b]
+
+        ids1_raw, f1_raw = per_id_border_fraction(L1)
+        ids2_raw, f2_raw = per_id_border_fraction(L2)
+
+        # drop -1, sort
+        keep1 = (ids1_raw != -1)
+        keep2 = (ids2_raw != -1)
+
+        ids1 = torch.sort(ids1_raw[keep1]).values
+        f1   = f1_raw[keep1]
+
+        ids2 = torch.sort(ids2_raw[keep2]).values
+        f2   = f2_raw[keep2]
+
+        union_ids = _union_ids(ids1, ids2)
+
+        if union_ids.numel() == 0:
+            sims[b] = float('nan')
+            continue
+
+        per_id_scores = []
+        for cid in union_ids:
+            in1 = _in_tensor(cid, ids1)
+            in2 = _in_tensor(cid, ids2)
+
+            if in1 and in2:
+                p1 = f1[ids1 == cid][0]
+                p2 = f2[ids2 == cid][0]
+
+                if torch.isfinite(p1) and torch.isfinite(p2):
+                    mn = torch.minimum(p1, p2)
+                    mx = torch.maximum(p1, p2)
+                    score_id = mn / mx
+                else:
+                    score_id = torch.tensor(0.0, device=device, dtype=torch.float32)
+            else:
+                score_id = torch.tensor(0.0, device=device, dtype=torch.float32)
+
+            per_id_scores.append(score_id)
+
+        per_id_scores = torch.stack(per_id_scores)
+        sims[b] = 100.0 * per_id_scores.mean()
+
+    return sims
+
+
+def report_missing_ids(labels1: torch.Tensor, labels2: torch.Tensor) -> None:
+    """
+    Print IDs that are in labels1 but not labels2, and vice versa, per batch.
+    Ignores NaN and -1.
+    No union1d/setdiff1d.
+    """
+    assert labels1.shape == labels2.shape and labels1.ndim == 4, "labels must both be (B,Z,Y,X)"
+    B = labels1.shape[0]
+
+    for b in range(B):
+        L1 = labels1[b]
+        L2 = labels2[b]
+
+        m1 = ~torch.isnan(L1)
+        m2 = ~torch.isnan(L2)
+
+        if not (m1.any() or m2.any()):
+            print(f"[batch {b}] both empty")
+            continue
+
+        ids1 = torch.unique(L1[m1]) if m1.any() else torch.empty(0, device=L1.device, dtype=L1.dtype)
+        ids2 = torch.unique(L2[m2]) if m2.any() else torch.empty(0, device=L2.device, dtype=L2.dtype)
+
+        ids1 = ids1[ids1 != -1]
+        ids2 = ids2[ids2 != -1]
+
+        # manual setdiff
+        only1 = []
+        for val in ids1:
+            if not (ids2 == val).any():
+                only1.append(val.item())
+        only2 = []
+        for val in ids2:
+            if not (ids1 == val).any():
+                only2.append(val.item())
+
+        if len(only1) == 0 and len(only2) == 0:
+            print(f"[batch {b}] no missing IDs")
+        else:
+            if len(only1) > 0:
+                print(f"[batch {b}] present in labels1, missing in labels2:", only1)
+            if len(only2) > 0:
+                print(f"[batch {b}] present in labels2, missing in labels1:", only2)
+
+def ids_from_centers(final_coords: torch.Tensor, matches: torch.Tensor) -> torch.Tensor:
+    """
+    final_coords: (3, D, H, W) with per-voxel coords to center [z,y,x]
+    matches:      (K, 4) rows = [ID_from_c1, z_from_centers_sorted, y_from_centers_sorted, x_from_centers_sorted]
+
+    Returns:
+      (D, H, W) tensor of IDs looked up from matches via the voxel's center coords.
+    """
+    assert final_coords.ndim == 4 and final_coords.shape[0] == 3
+    assert matches.ndim == 2 and matches.shape[1] == 4
+
+    _, D, H, W = final_coords.shape
+    device = final_coords.device
+
+    # Build a sparse volume where each matched center stores its ID
+    id_dtype = matches[:, 0].dtype
+    id_volume = torch.full((D, H, W), -1, device=device, dtype=id_dtype)
+
+    zc = matches[:, 1].round().long()
+    yc = matches[:, 2].round().long()
+    xc = matches[:, 3].round().long()
+
+    # in-bounds mask
+    inb = (zc >= 0) & (zc < D) & (yc >= 0) & (yc < H) & (xc >= 0) & (xc < W)
+    if inb.any():
+        id_volume[zc[inb], yc[inb], xc[inb]] = matches[inb, 0].to(id_dtype)
+
+    # For each voxel, fetch the ID at its center coordinate
+    z = final_coords[0].round().long().clamp_(0, D - 1)
+    y = final_coords[1].round().long().clamp_(0, H - 1)
+    x = final_coords[2].round().long().clamp_(0, W - 1)
+
+    return id_volume[z, y, x]

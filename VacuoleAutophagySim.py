@@ -230,8 +230,48 @@ def center_weight_mask(shape=(200,200,200), center=None, sigma=100.0, device='cu
 
 from PIL import Image
 
-def nameTBD(gen_outputs, expectedBodies, savePath=""):
-    distToCenter = modelFlowToCenter(gen_outputs)
+def nameTBD(gen_outputs, oldCenters, savePath=""):
+    distToCenter = modelFlowToCenter(gen_outputs, iters=1000, step=0.5, mask_thresh=0.0, repel=0.2)
+    coords_idx = displacements_to_coords(distToCenter, round_to_int=True)
+    triplets = coords_idx.permute(1, 2, 3, 0)
+    triplets = triplets[~torch.isnan(triplets[:,:,:,0]) & ~torch.isnan(triplets[:,:,:,1]) & ~torch.isnan(triplets[:,:,:,2])]
+    triplets = triplets.reshape(-1,3)
+
+    unique_triplets, counts = torch.unique(triplets, dim=0, return_counts=True) # how many map to each voxel
+    
+    result = torch.cat([counts.unsqueeze(1), unique_triplets], dim=1)
+    
+    centers = drop_nearby_by_count(result, radius=2.0, minCount=0)
+    idx = torch.argsort(centers[:, 0], descending=True)
+    centers_sorted = centers[idx]
+    oldCenters = oldCenters.squeeze(0)
+    centers_sorted = centers_sorted[:(len(oldCenters)+1), :]
+
+    final_coords = snap_coords_fast(coords_idx, centers_sorted,
+    r_snap=1,          # radius => includes ±3 in each axis
+    r_neighbor=3,      # radius => includes ±3
+    treat_zero_as_bg=True,
+    interpret="radius")
+
+    oldCenters = oldCenters.to(centers_sorted.device)
+    newCentersWithIDs = hungarian_match_coordinates(centers_sorted, oldCenters.squeeze(0))
+
+
+    ids = ids_from_centers(final_coords, newCentersWithIDs)
+    rgb_slice = render_cluster_slice(ids, axis='z', index=100, background='black')
+
+    if savePath != "":
+        Image.fromarray(rgb_slice.cpu().numpy()).save(savePath+".png")
+    else:
+        plt.imshow(rgb_slice.cpu().numpy())  # rgb_slice is (H,W,3) uint8
+        plt.axis('off')
+        plt.show()
+
+
+
+
+def nameTBD2(gen_outputs, expectedBodies, savePath=""):
+    distToCenter = gen_outputs[:, :3, ...]
     coords_idx = displacements_to_coords(distToCenter, round_to_int=True)
     triplets = coords_idx.permute(1, 2, 3, 0)
     triplets = triplets[~torch.isnan(triplets[:,:,:,0]) & ~torch.isnan(triplets[:,:,:,1]) & ~torch.isnan(triplets[:,:,:,2])]
@@ -252,21 +292,70 @@ def nameTBD(gen_outputs, expectedBodies, savePath=""):
     treat_zero_as_bg=True,
     interpret="radius")
 
-    ids = cluster_ids_from_coords(final_coords)
-    rgb_slice = render_cluster_slice(ids, axis='z', index=100, background='black')
 
-    if savePath != "":
-        Image.fromarray(rgb_slice.cpu().numpy()).save(savePath+".png")
-    else:
-        plt.imshow(rgb_slice.cpu().numpy())  # rgb_slice is (H,W,3) uint8
-        plt.axis('off')
-        plt.show()
+    mediumMask = gen_outputs[:,1:,...]
+
+    final_coords[mediumMask] = torch.nan
+
+
+
+
+    ids = cluster_ids_from_coords(final_coords)
+
+    return ids
+    #rgb_slice = render_cluster_slice(ids, axis='y', index=100, background='black')
+
+    #if savePath != "":
+    #    Image.fromarray(rgb_slice.cpu().numpy()).save(savePath+".png")
+    #else:
+    #    plt.imshow(rgb_slice.cpu().numpy())  # rgb_slice is (H,W,3) uint8
+    #    plt.axis('off')
+    #    plt.show()
+
+
+
+
+
+def modelOutputToVol(gen_outputs, oldCenters):
+    distToCenter = modelFlowToCenter(gen_outputs, iters=1000, step=1.0, mask_thresh=0.0, repel=0.2)
+    coords_idx = displacements_to_coords(distToCenter, round_to_int=True)
+    triplets = coords_idx.permute(1, 2, 3, 0)
+    triplets = triplets[~torch.isnan(triplets[:,:,:,0]) & ~torch.isnan(triplets[:,:,:,1]) & ~torch.isnan(triplets[:,:,:,2])]
+    triplets = triplets.reshape(-1,3)
+
+    unique_triplets, counts = torch.unique(triplets, dim=0, return_counts=True) # how many map to each voxel
+    
+    result = torch.cat([counts.unsqueeze(1), unique_triplets], dim=1)
+    
+    centers = drop_nearby_by_count(result, radius=2.0, minCount=0)
+    idx = torch.argsort(centers[:, 0], descending=True)
+    centers_sorted = centers[idx]
+    oldCenters = oldCenters.squeeze(0)
+    centers_sorted = centers_sorted[:(len(oldCenters)+1), :]
+
+    final_coords = snap_coords_fast(coords_idx, centers_sorted,
+    r_snap=1,          # radius => includes ±3 in each axis
+    r_neighbor=3,      # radius => includes ±3
+    treat_zero_as_bg=True,
+    interpret="radius")
+
+    oldCenters = oldCenters.to(centers_sorted.device)
+    newCentersWithIDs = hungarian_match_coordinates(centers_sorted, oldCenters.squeeze(0))
+
+
+    ids = ids_from_centers(final_coords, newCentersWithIDs)
+
+    del distToCenter, coords_idx, triplets, unique_triplets,counts,result,centers,centers_sorted,final_coords
+    return ids, newCentersWithIDs
+
+
+
 
 
 
 # --------- MEMORY-EFFICIENT TRAIN (loss math unchanged) ---------
 
-def train(gen_model, disc_model, dataloader,
+def trainOld2(gen_model, disc_model, dataloader,
           gen_optimizer, disc_optimizer,
           gen_dist_criterion, gen_dir_criterion,   # kept for signature parity
           disc_criterion, device, epochNumber):
@@ -287,8 +376,8 @@ def train(gen_model, disc_model, dataloader,
     real_weight = 1.0
     fake_weight = 1.0
     
-    gen_prob_weight = 2
-    gen_dir_weight = 1
+    gen_prob_weight = 5
+    gen_dir_weight = 2.5
     adv_weight = 3
 
     # bookkeeping
@@ -298,6 +387,9 @@ def train(gen_model, disc_model, dataloader,
     running_real_loss     = 0.0
     running_fake_loss     = 0.0
     running_adv_loss      = 0.0
+    running_p1     = 0.0
+    running_p2     = 0.0
+    running_p3     = 0.0
     total = 0
 
     S = 5  # number of generator draws per x (same as your 5 rows)
@@ -313,14 +405,15 @@ def train(gen_model, disc_model, dataloader,
     sigma_sched.step()
     printAndLog(f"New sigma: {sigma_sched.value:.4f}")
 
-    for index, (volumes, (t1,c1),(t2,c2),(t3,c3),(t4,c4),(t5,c5), steps, path1) in enumerate(dataloader):
-        if True:
+    for index, ((volumes, oldCenters, inputVol), (t1,c1, vol1),(t2,c2, vol2),(t3,c3, vol3),(t4,c4, vol4),(t5,c5, vol5), steps, path1) in enumerate(dataloader):
+        if False:
 
-            folder = "C:\\Users\\evans\\Documents\\Independent Example Tests\\Examples B\\Example" + str(index)
-            os.mkdir(folder)
-            volumes = volumes.to(device, non_blocking=True)
+            volumes = volumes.to(device)
+            t1 = t1.to(device)
             gout = gen_model(volumes, steps[0].item())
-            nameTBD(gout, len(c1.squeeze(0))+1, (folder + "\\Trial " + str(1)))
+            nameTBD(volumes, oldCenters, "C:\\Users\\evans\\New folder\\Original")
+            nameTBD(t1, oldCenters, "C:\\Users\\evans\\New folder\\gt")
+            nameTBD(gout, oldCenters, "C:\\Users\\evans\\New folder\\Model")
             del gout
             gc.collect()
             if torch.cuda.is_available():
@@ -403,6 +496,13 @@ def train(gen_model, disc_model, dataloader,
                         t3.to(device, non_blocking=True),
                         t4.to(device, non_blocking=True),
                         t5.to(device, non_blocking=True)]
+        inputVol = inputVol.to(device, non_blocking=True)
+
+        vol_list = [vol1.to(device, non_blocking=True),
+                        vol2.to(device, non_blocking=True),
+                        vol3.to(device, non_blocking=True),
+                        vol4.to(device, non_blocking=True),
+                        vol5.to(device, non_blocking=True)]
 
         # ===== Prep targets ONCE (no grad), same normalization as your code =====
         # We create TWO views for each target:
@@ -452,6 +552,9 @@ def train(gen_model, disc_model, dataloader,
                     # gen_prob_loss — EXACTLY your call (CE against UNBLURRED targets)
                     weights = torch.tensor([0.055, 0.07, 0.875], device=device)
                     l_prob_ps = F.cross_entropy(p_prb, T_prob_raw[i], label_smoothing=0.075, weight=weights, reduction='none')*midWeights
+
+                    #ids = nameTBD(gen_outputs, oldCenters)
+
                     # reduction='none' returns [B, C?, ...]? CE expects class targets normally;
                     # your code uses distribution (one-hot / probs). Keep it: reduction='none' then mean over spatial dims.
                     # F.cross_entropy with probs target returns per-element loss; average over dims to [B]:
@@ -548,6 +651,17 @@ def train(gen_model, disc_model, dataloader,
                 midWeights = (center_weight_mask(T_norm[i].shape[-3:], sigma=50, device=T_norm[i].device)/2)+2
                 midWeights = midWeights.unsqueeze(0)
                 dir_vec       = _cos_dir_loss_per_sample(directions, T_norm[i][:, :3, ...], T_valid[i], midWeights)  # [B]
+
+                with torch.no_grad():
+                    modelVol, calculatedCenters = modelOutputToVol(gen_outputs=gen_outputs, oldCenters=oldCenters)
+                    modelVol = modelVol.unsqueeze(0)
+                    p1 = volume_similarity_percent(modelVol, vol_list[i].squeeze(0))
+                    p2 = aspect_similarity_percent(modelVol, vol_list[i].squeeze(0))
+                    p3 = border_touch_similarity_percent(modelVol, vol_list[i].squeeze(0))
+
+                    del modelVol, calculatedCenters, p1, p2, p3
+                    torch.cuda.empty_cache()
+
                 gen_dir_loss  = (dir_vec[bmask].mean() if bmask.any() else dir_vec.mean())               # scalar
 
                 # ---- gen_prob_loss (memory-lean CE) ----
@@ -578,6 +692,10 @@ def train(gen_model, disc_model, dataloader,
                 print(f"Total:    {(gen_dir_loss + gen_prob_loss + adv_loss).item():.6f} "
                     f"[{(gen_dir_loss*gen_dir_weight + gen_prob_loss*gen_prob_weight + adv_loss*adv_weight).item():.6f}]")
                 
+                print(f"Volume Accuracy: {p1.item():.2f}%")
+                print(f"Aspect Accuracy: {p2.item():.2f}%")
+                print(f"Border Touch Accuracy: {p3.item():.2f}%")
+                
 
                 gdir  = float(gen_dir_loss.detach())
                 gprob = float(gen_prob_loss.detach())
@@ -587,10 +705,14 @@ def train(gen_model, disc_model, dataloader,
                 running_gen_dir_loss  += gdir  * B
                 running_adv_loss      += gadv  * B
 
+                running_p1  += p1 * B
+                running_p2  += p2  * B
+                running_p3  += p3  * B
+
                 running_loss += gprob + gdir + gadv
 
                 # (optional) free temps early
-                del gen_outputs, directions, probabilities, logp, ce_map, adv_out
+                del gen_outputs, directions, probabilities, logp, ce_map, adv_out, modelVol, calculatedCenters
 
         gen_optimizer.step()
 
@@ -620,6 +742,10 @@ def train(gen_model, disc_model, dataloader,
     printAndLog("Epoch_fake:"     + str( running_fake_loss    /total) + "[" + str( running_fake_loss    *1.0         /total) + "]" + "\n")
     printAndLog("Epoch_adv:"      + str( running_adv_loss     /total) + "[" + str( running_adv_loss     *adv_weight   /total) + "]" + "\n")
 
+    printAndLog("Epoch_real:"     + str( running_p1    /total) + "[" + str( running_p1        /total) + "]" + "\n")
+    printAndLog("Epoch_fake:"     + str( running_p2    /total) + "[" + str( running_p2         /total) + "]" + "\n")
+    printAndLog("Epoch_adv:"      + str( running_p3     /total) + "[" + str( running_p3   /total) + "]" + "\n")
+
     avg_D_Loss  = ((running_real_loss + running_fake_loss)/total)/2 
     d_loss_diff = (abs(running_real_loss - running_fake_loss))/total
     avg_D_Loss_weighted  = ((running_real_loss*1.0 + running_fake_loss*1.0)/total)/2 
@@ -646,11 +772,485 @@ def train(gen_model, disc_model, dataloader,
 
 
 
+def train(gen_model, disc_model, dataloader,
+          gen_optimizer, disc_optimizer,
+          gen_dist_criterion, gen_dir_criterion,   # kept for signature parity
+          disc_criterion, device, epochNumber,
+          useAMP=False):
 
+    import torch
+    from torch.cuda.amp import autocast, GradScaler
 
+    global sigma_sched
 
+    gen_model.train()
+    disc_model.train()
 
+    eps = 1e-8
+    real_weight = 1.0
+    fake_weight = 1.0
+    
+    gen_prob_weight = 5
+    gen_dir_weight  = 2.5
+    adv_weight      = 3
 
+    running_loss = 0.0
+    running_gen_prob_loss = 0.0
+    running_gen_dir_loss  = 0.0
+    running_real_loss     = 0.0
+    running_fake_loss     = 0.0
+    running_adv_loss      = 0.0
+    running_p1            = 0.0
+    running_p2            = 0.0
+    running_p3            = 0.0
+    total = 0
+
+    S = 5  # number of generator draws per x
+
+    # AMP scalers
+    scaler_disc = torch.amp.GradScaler(device=device.type, enabled=useAMP)
+    scaler_gen  = torch.amp.GradScaler(device=device.type,enabled=useAMP)
+
+    needToPrint = True
+    for m in disc_model.modules():
+        if isinstance(m, ScheduledDropout):
+            if needToPrint:
+                printAndLog(f"Dropout: {m.value:.4f}")
+                needToPrint=False
+
+    sigma_sched.step()
+    printAndLog(f"New sigma: {sigma_sched.value:.4f}")
+
+    # dataloader now yields PATHS ONLY
+    # for index, ((oldPath),(t1Path),(t2Path),(t3Path),(t4Path),(t5Path), flips, steps)
+    for index, ((oldPath),
+                (t1Path),
+                (t2Path),
+                (t3Path),
+                (t4Path),
+                (t5Path),
+                flips,
+                steps) in enumerate(dataloader):
+
+        print(index+1, "/", len(dataloader))
+
+        # ============================================================
+        # LOAD MAIN SAMPLE ONCE (volumes, oldCenters, inputVol)
+        # ============================================================
+        volumes, oldCenters, inputVol = loadData(oldPath, device, flips)
+        volumes  = volumes.to(device, non_blocking=True)
+        inputVol = inputVol.to(device, non_blocking=True)
+        B = volumes.size(0)
+
+        # ============================================================
+        # PHASE 1: Build cost_mat [B,S,5] with NO GRAD
+        # ============================================================
+        with torch.no_grad():
+            preds_no_grad = []
+            for _s in range(S):
+                gout = gen_model(volumes, steps[0].item())          # [B,C,D,H,W]
+                gout = _normalize_dirs_nograd(gout)                 # dir norm (no grad)
+                preds_no_grad.append(gout)
+
+            rows = []  # length S, each [B,5]
+            for s in range(S):
+                ps    = preds_no_grad[s]        # [B,C,D,H,W]
+                p_dir = ps[:, :3, ...]
+                p_prb = ps[:, 3:, ...]
+                row_terms = []
+
+                # iterate each future target path
+                for tPath in [t1Path, t2Path, t3Path, t4Path, t5Path]:
+                    # load target now
+                    t_full, c_full, vol_full = loadData(tPath, device, flips)
+                    t_full = t_full.to(device, non_blocking=True)
+
+                    # normalize dirs for this target
+                    tn = t_full.clone()
+                    g  = tn[:, :3, ...]
+                    gn = torch.linalg.norm(g, dim=1, keepdim=True).clamp_min(eps)
+                    tn[:, :3, ...] = g / gn
+
+                    valid_mask = ((tn[:,3,...] == 1) | (tn[:,4,...] == 1)).to(tn.dtype)  # [B,D,H,W]
+                    tprob_raw  = tn[:, 3:, ...].clone()  # [B,3,D,H,W]
+
+                    midWeights = (center_weight_mask(
+                        tn.shape[-3:],
+                        sigma=50,
+                        device=tn.device
+                    )/2)+2
+                    midWeights = midWeights.unsqueeze(0)  # [1,1,D,H,W] -> broadcast
+
+                    # dir term
+                    l_dir_ps = _cos_dir_loss_per_sample(
+                        p_dir,
+                        tn[:, :3, ...],
+                        valid_mask,
+                        midWeights
+                    )  # [B]
+
+                    # prob term (cross-entropy style)
+                    weights = torch.tensor([0.055, 0.07, 0.875], device=device)
+                    l_prob_ps = F.cross_entropy(
+                        p_prb,
+                        tprob_raw,
+                        label_smoothing=0.075,
+                        weight=weights,
+                        reduction='none'
+                    ) * midWeights
+
+                    if l_prob_ps.ndim > 1:
+                        l_prob_ps = l_prob_ps.mean(dim=tuple(range(1, l_prob_ps.ndim)))  # [B]
+
+                    # adv term
+                    adv_out   = disc_model(ps)
+                    l_adv_ps  = disc_criterion(adv_out, torch.ones_like(adv_out))
+                    if l_adv_ps.ndim > 1:
+                        l_adv_ps = l_adv_ps.mean(dim=tuple(range(1, l_adv_ps.ndim)))     # [B]
+
+                    row_terms.append(
+                        gen_dir_weight*l_dir_ps
+                        + gen_prob_weight*l_prob_ps
+                        + adv_weight*l_adv_ps
+                    )  # [B]
+
+                    # free target tensors immediately
+                    del t_full, c_full, vol_full
+                    del tn, g, gn
+                    del valid_mask, tprob_raw
+                    del midWeights
+                    del l_dir_ps, l_prob_ps, adv_out, l_adv_ps
+
+                row_terms = torch.stack(row_terms, dim=1)  # [B,5]
+                rows.append(row_terms)
+                del ps, p_dir, p_prb, row_terms
+
+            cost_mat = torch.stack(rows, dim=1).detach()  # [B,S,5]
+
+            del rows, preds_no_grad
+
+        # match
+        match_mask = _greedy_match(cost_mat)  # [B,S,5]
+        if match_mask.sum() == 0:
+            del cost_mat, match_mask
+            del volumes, oldCenters, inputVol
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            continue
+
+        # ============================================================
+        # PHASE 2: Discriminator update
+        # ============================================================
+        set_requires_grad(gen_model, False)
+        set_requires_grad(disc_model, True)
+        disc_optimizer.zero_grad(set_to_none=True)
+
+        disc_terms = []
+
+        # precompute S fakes for D (generator frozen, so no grad here)
+        with torch.no_grad():
+            fakes_for_D = []
+            for _s in range(S):
+                gout = gen_model(volumes, steps[0].item())
+                gout = _normalize_dirs_nograd(gout)
+                fake_output = gout.detach().clone()
+                idx = fake_output[:, -3:, ...].argmax(dim=1, keepdim=True)
+                fake_output[:, -3:, ...] = torch.zeros_like(fake_output[:, -3:, ...]).scatter_(1, idx, 1.0)
+                fakes_for_D.append(fake_output)
+
+        # now do disc forward/backward with grad
+        with torch.amp.autocast(device_type=device.type, enabled=useAMP):
+            for s in range(S):
+                for i_idx, tPath in enumerate([t1Path, t2Path, t3Path, t4Path, t5Path]):
+                    if not match_mask[:, s, i_idx].any():
+                        continue
+
+                    # REAL branch
+                    t_full, c_full, vol_full = loadData(tPath, device, flips)
+                    t_full = t_full.to(device, non_blocking=True)
+
+                    tn = t_full.clone()
+                    g  = tn[:, :3, ...]
+                    gn = torch.linalg.norm(g, dim=1, keepdim=True).clamp_min(eps)
+                    tn[:, :3, ...] = g / gn
+
+                    disc_outputs_real = disc_model(tn)
+                    real_loss = disc_criterion(
+                        disc_outputs_real,
+                        torch.full_like(disc_outputs_real, 0.85)
+                    )
+
+                    # FAKE branch
+                    disc_outputs_fake = disc_model(fakes_for_D[s])
+                    fake_loss = disc_criterion(
+                        disc_outputs_fake,
+                        torch.full_like(disc_outputs_fake, 0.15)
+                    )
+
+                    term = (fake_loss * fake_weight) + (real_loss * real_weight)
+
+                    print(f"[Discriminator {len(disc_terms)+1}/{5*B}]")
+                    print(f"Real: {real_loss.item():.6f} [{(real_loss*real_weight).item():.6f}]")
+                    print(f"Fake: {fake_loss.item():.6f} [{(fake_loss*fake_weight).item():.6f}]")
+                    print(
+                        f"Total: {(real_loss + fake_loss).item():.6f} "
+                        f"[{((real_loss*real_weight) + (fake_loss*fake_weight)).item():.6f}]"
+                    )
+
+                    if term.ndim > 0:
+                        term = term.mean()
+                    disc_terms.append(term)
+
+                    del t_full, c_full, vol_full, tn, g, gn
+                    del disc_outputs_real, disc_outputs_fake, real_loss, fake_loss, term
+
+            disc_loss = torch.stack(disc_terms).mean()
+
+        # backward + step for disc
+        if useAMP:
+            scaler_disc.scale(disc_loss).backward()
+            scaler_disc.step(disc_optimizer)
+            scaler_disc.update()
+        else:
+            disc_loss.backward()
+            disc_optimizer.step()
+
+        del disc_terms, fakes_for_D, disc_loss
+
+        # ============================================================
+        # PHASE 3: Generator update
+        # ============================================================
+        pairs_mask = match_mask.any(dim=0)   # [S,5]
+        num_terms  = int(pairs_mask.sum().item())
+
+        set_requires_grad(disc_model, False)
+        set_requires_grad(gen_model, True)
+        gen_optimizer.zero_grad(set_to_none=True)
+
+        printed = 0
+        for s in range(S):
+            for i_idx, tPath in enumerate([t1Path, t2Path, t3Path, t4Path, t5Path]):
+                if not pairs_mask[s, i_idx]:
+                    continue
+
+                # forward WITH grad
+                with torch.amp.autocast(device_type=device.type, enabled=useAMP):
+                    gen_outputs  = gen_model(volumes, steps[0].item())
+                    gen_outputs  = _normalize_dirs_grad(gen_outputs)
+                    directions   = gen_outputs[:, :3, ...]
+                    probabilities= gen_outputs[:, 3:, ...]
+
+                    bmask = match_mask[:, s, i_idx]  # [B] bool
+
+                    # load GT for this target
+                    t_full, c_full, vol_full = loadData(tPath, device, flips)
+                    t_full    = t_full.to(device, non_blocking=True)
+                    vol_full  = vol_full.to(device, non_blocking=True)
+
+                    tn = t_full.clone()
+                    g  = tn[:, :3, ...]
+                    gn = torch.linalg.norm(g, dim=1, keepdim=True).clamp_min(eps)
+                    tn[:, :3, ...] = g / gn
+
+                    valid_mask = ((tn[:,3,...] == 1) | (tn[:,4,...] == 1)).to(tn.dtype)
+                    tprob_raw  = tn[:, 3:, ...].clone()
+
+                    midWeights = (center_weight_mask(
+                        tn.shape[-3:],
+                        sigma=50,
+                        device=tn.device
+                    )/2)+2
+                    midWeights = midWeights.unsqueeze(0)
+
+                    # dir loss
+                    dir_vec = _cos_dir_loss_per_sample(
+                        directions,
+                        tn[:, :3, ...],
+                        valid_mask,
+                        midWeights
+                    )  # [B]
+
+                    # metrics (no grad)
+                    with torch.no_grad():
+                        modelVol, calculatedCenters = modelOutputToVol(
+                            gen_outputs=gen_outputs,
+                            oldCenters=oldCenters
+                        )
+                        modelVol = modelVol.unsqueeze(0)
+
+                        p1 = volume_similarity_percent(modelVol, vol_full)
+                        p2 = aspect_similarity_percent(modelVol, vol_full)
+                        p3 = border_touch_similarity_percent(modelVol, vol_full)
+
+                        p1_val = float(p1.detach())
+                        p2_val = float(p2.detach())
+                        p3_val = float(p3.detach())
+
+                        del modelVol, calculatedCenters, p1, p2, p3
+                        torch.cuda.empty_cache()
+
+                    gen_dir_loss = (dir_vec[bmask].mean() if bmask.any() else dir_vec.mean())
+
+                    # prob loss
+                    logp   = torch.log_softmax(probabilities, dim=1)
+                    valid2 = tprob_raw.sum(dim=1).clamp_max(1).to(logp.dtype)
+                    ce_map = -(tprob_raw * logp).sum(dim=1)
+                    ce_map = ce_map * midWeights
+
+                    num = (ce_map * valid2).sum(dim=(1,2,3))
+                    den = valid2.sum(dim=(1,2,3)).clamp_min(1)
+                    prob_vec      = num / den
+                    gen_prob_loss = (prob_vec[bmask].mean() if bmask.any() else prob_vec.mean())
+
+                    # adv loss
+                    adv_out = disc_model(gen_outputs)
+                    adv_vec = ((adv_out - torch.ones_like(adv_out))**2).mean(
+                        dim=tuple(range(1, adv_out.ndim))
+                    )
+                    adv_loss = (adv_vec[bmask].mean() if bmask.any() else adv_vec.mean())
+
+                    gterm = gen_dir_loss*gen_dir_weight \
+                            + gen_prob_loss*gen_prob_weight \
+                            + adv_loss*adv_weight
+
+                # backward for generator (scaled or not)
+                if useAMP:
+                    scaler_gen.scale(gterm / num_terms).backward()
+                else:
+                    (gterm / num_terms).backward()
+
+                printed += 1
+                print(f"[Generator {printed}/5]")
+
+                gdir  = float(gen_dir_loss.detach())
+                gprob = float(gen_prob_loss.detach())
+                gadv  = float(adv_loss.detach())
+
+                print(f"Gen_dir:  {gdir:.6f} [{(gdir*gen_dir_weight):.6f}]")
+                print(f"Gen_prob: {gprob:.6f} [{(gprob*gen_prob_weight):.6f}]")
+                print(f"Adv:      {gadv:.6f} [{(gadv*adv_weight):.6f}]")
+                print(
+                    f"Total:    {(gdir + gprob + gadv):.6f} "
+                    f"[{(gdir*gen_dir_weight + gprob*gen_prob_weight + gadv*adv_weight):.6f}]"
+                )
+                print(f"Volume Accuracy: {p1_val:.2f}%")
+                print(f"Aspect Accuracy: {p2_val:.2f}%")
+                print(f"Border Touch Accuracy: {p3_val:.2f}%")
+
+                running_gen_prob_loss += gprob * B
+                running_gen_dir_loss  += gdir  * B
+                running_adv_loss      += gadv  * B
+
+                running_p1  += p1_val * B
+                running_p2  += p2_val * B
+                running_p3  += p3_val * B
+
+                running_loss += gprob + gdir + gadv
+
+                # free per-(s,i) stuff
+                del gen_outputs, directions, probabilities
+                del t_full, c_full, vol_full
+                del tn, g, gn, valid_mask, tprob_raw
+                del midWeights, dir_vec
+                del logp, valid2, ce_map, num, den, prob_vec
+                del adv_out, adv_vec, gen_dir_loss, gen_prob_loss, adv_loss, gterm
+                torch.cuda.empty_cache()
+
+        # step optimizer for generator
+        if useAMP:
+            scaler_gen.step(gen_optimizer)
+            scaler_gen.update()
+        else:
+            gen_optimizer.step()
+
+        # ============================================================
+        # LOGGING / METRICS AT BATCH END
+        # ============================================================
+        with torch.no_grad():
+            t_full_log, c_full_log, vol_full_log = loadData(t1Path, device, flips)
+            t_full_log = t_full_log.to(device, non_blocking=True)
+
+            tn_log = t_full_log.clone()
+            g_log  = tn_log[:, :3, ...]
+            gn_log = torch.linalg.norm(g_log, dim=1, keepdim=True).clamp_min(eps)
+            tn_log[:, :3, ...] = g_log / gn_log
+
+            disc_real_log = disc_model(tn_log)
+            real_loss_log = disc_criterion(
+                disc_real_log,
+                torch.full_like(disc_real_log, 0.85)
+            ).mean()
+
+            fake_quick = _normalize_dirs_nograd(gen_model(volumes, steps[0].item()))
+            idx = fake_quick[:, -3:, ...].argmax(dim=1, keepdim=True)
+            fake_quick[:, -3:, ...] = torch.zeros_like(fake_quick[:, -3:, ...]).scatter_(1, idx, 1.0)
+            disc_fake_log = disc_model(fake_quick)
+            fake_loss_log = disc_criterion(
+                disc_fake_log,
+                torch.full_like(disc_fake_log, 0.15)
+            ).mean()
+
+            del t_full_log, c_full_log, vol_full_log
+            del tn_log, g_log, gn_log
+            del disc_real_log, disc_fake_log, fake_quick
+            torch.cuda.empty_cache()
+
+        running_loss      += (float(real_loss_log) + float(fake_loss_log)) * B
+        running_real_loss += float(real_loss_log) * B
+        running_fake_loss += float(fake_loss_log) * B
+        total += B
+
+        del real_loss_log, fake_loss_log
+        del cost_mat, match_mask, pairs_mask
+        del volumes, oldCenters, inputVol
+        torch.cuda.empty_cache()
+
+    # ===========================
+    # end-epoch logging / sched
+    # ===========================
+    printAndLog("\n")
+    printAndLog("Epoch_gen_prob:" + str(running_gen_prob_loss/total) +
+                "[" + str(running_gen_prob_loss*gen_prob_weight/total) + "]" + "\n")
+    printAndLog("Epoch_gen_dir:"  + str(running_gen_dir_loss /total) +
+                "[" + str(running_gen_dir_loss *gen_dir_weight /total) + "]" + "\n")
+    printAndLog("Epoch_real:"     + str(running_real_loss    /total) +
+                "[" + str(running_real_loss    *1.0         /total) + "]" + "\n")
+    printAndLog("Epoch_fake:"     + str(running_fake_loss    /total) +
+                "[" + str(running_fake_loss    *1.0         /total) + "]" + "\n")
+    printAndLog("Epoch_adv:"      + str(running_adv_loss     /total) +
+                "[" + str(running_adv_loss     *adv_weight   /total) + "]" + "\n")
+
+    printAndLog("Epoch_real:"     + str(running_p1    /total) +
+                "[" + str(running_p1        /total) + "]" + "\n")
+    printAndLog("Epoch_fake:"     + str(running_p2    /total) +
+                "[" + str(running_p2        /total) + "]" + "\n")
+    printAndLog("Epoch_adv:"      + str(running_p3    /total) +
+                "[" + str(running_p3        /total) + "]" + "\n")
+
+    avg_D_Loss  = ((running_real_loss + running_fake_loss)/total)/2 
+    d_loss_diff = (abs(running_real_loss - running_fake_loss))/total
+    avg_D_Loss_weighted  = ((running_real_loss*1.0 + running_fake_loss*1.0)/total)/2 
+    d_loss_weighted_diff = (abs(running_real_loss*1.0 - running_fake_loss*1.0))/total
+
+    printAndLog("avg_D_Loss:" + str(avg_D_Loss) +
+                "[" + str(avg_D_Loss_weighted) + "]" + "\n")
+    printAndLog("d_loss_diff:" + str(d_loss_diff) +
+                "[" + str(d_loss_weighted_diff) + "]" + "\n")
+    printAndLog("------------------------------------------" + "\n")
+
+    needToPrint = True
+    for m in disc_model.modules():
+        if isinstance(m, ScheduledDropout):
+            m.step()
+            if needToPrint:
+                printAndLog(f"New dropout: {m.value:.4f}")
+                needToPrint=False
+
+    sigma_sched.step()
+    printAndLog(f"New sigma: {sigma_sched.value:.4f}")
+
+    return running_loss / max(total, 1)
 
 
 
@@ -1468,10 +2068,13 @@ def preprocess_all(paths, device, num_workers, parallel=False):
         for idx in range(len(paths)):
             for outputNumber in range(5):
                 for steps in range(6):
-                    output = f"outputs_{(outputNumber+1):02d}"
-                    stepNumber=(steps+1)*50
-                    _,_ = parse_voxel_file_for_distance(paths[idx] + "\\" + output + f"\\output{stepNumber:03d}.piff", device=device, parallel=parallel)
-                    
+                    try:
+                        print(idx,outputNumber,steps, " of ", len(paths), 5, 6)
+                        output = f"outputs_{(outputNumber+1):02d}"
+                        stepNumber=(steps+1)*50
+                        _,_,_ = parse_voxel_file_for_distance(paths[idx] + "\\" + output + f"\\output{stepNumber:03d}.piff", device=device, parallel=parallel)
+                    except Exception as e:
+                        print("Error for " + paths[idx] + "\\" + output + f"\\output{stepNumber:03d}.piff" ) 
     
 
     # Build all file paths once (avoids work in workers)
@@ -1530,7 +2133,7 @@ def main():
     parser.add_argument('--gen_lr', type=float, default=4e-4, help='Learning rate for the Generator')
     parser.add_argument('--disc_lr', type=float, default=1e-4, help='Learning rate for the Discriminator')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers to use')
-    parser.add_argument('--shuffle', type=bool, default=True, help='Whether to Shuffle the data')
+    parser.add_argument('--shuffle', type=bool, default=False, help='Whether to Shuffle the data')
     parser.add_argument('--pin_memory', type=bool, default=True, help='Whether to use pin_memory')
     parser.add_argument('--persistent_workers', type=bool, default=True, help='Whether to keep workers across each epoch')
     parser.add_argument('--preprocess_training_data', type=bool, default=False, help='Whether to preprocess the training data before training')

@@ -1259,7 +1259,7 @@ def vote_gap(rows: torch.Tensor, k: int) -> float:
     return (v_k - v_k1).item()
 
 
-def modelFlowToCenter(gen_outputs: torch.tensor):
+def modelFlowToCenterOld(gen_outputs: torch.tensor):
     tmp = gen_outputs[0,:3,:].clone()
     logits = gen_outputs[0, 3:, ...].clone()          # [3, 200, 200, 200]
     tmpidx = logits.argmax(dim=0, keepdim=True) # [1, 200, 200, 200]
@@ -1308,38 +1308,6 @@ def modelFlowToCenter(gen_outputs: torch.tensor):
     tmp, mask = sum_with_next_from(tmp, tmp, neighbor_vals=tmp, avoid_self=True, mask=mask)
     return tmp
 
-
-
-def nameTBD2(distToCenter, expectedBodies, savePath=""):
-    coords_idx = displacements_to_coords(distToCenter, round_to_int=True)
-    triplets = coords_idx.permute(1, 2, 3, 0)
-    triplets = triplets[~torch.isnan(triplets[:,:,:,0]) & ~torch.isnan(triplets[:,:,:,1]) & ~torch.isnan(triplets[:,:,:,2])]
-    triplets = triplets.reshape(-1,3)
-
-    unique_triplets, counts = torch.unique(triplets, dim=0, return_counts=True) # how many map to each voxel
-    
-    result = torch.cat([counts.unsqueeze(1), unique_triplets], dim=1)
-    
-    centers = drop_nearby_by_count(result, radius=2.0, minCount=0)
-    idx = torch.argsort(centers[:, 0], descending=True)
-    centers_sorted = centers[idx]
-    centers_sorted = centers_sorted[:expectedBodies, :]
-
-    final_coords = snap_coords_fast(coords_idx, centers_sorted,
-    r_snap=1,          # radius => includes ±3 in each axis
-    r_neighbor=3,      # radius => includes ±3
-    treat_zero_as_bg=True,
-    interpret="radius")
-
-    ids = cluster_ids_from_coords(final_coords)
-    rgb_slice = render_cluster_slice(ids, axis='y', index=100, background='black')
-
-    if savePath != "":
-        Image.fromarray(rgb_slice.cpu().numpy()).save(savePath+".png")
-    else:
-        plt.imshow(rgb_slice.cpu().numpy())  # rgb_slice is (H,W,3) uint8
-        plt.axis('off')
-        plt.show()
 
 
 

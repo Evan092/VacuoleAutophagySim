@@ -6,7 +6,7 @@ class CustomBatchSampler(Sampler):
         self.dataset     = dataset
         self.batch_size  = batch_size
         self.frequency = 50
-        self.maxSteps = 6
+        self.maxSteps = 2
         self.threshold   = len(dataset)  # i.e. 80 if total is 100
         self.shuffle = shuffle
         self.drop_last = drop_last
@@ -22,7 +22,7 @@ class CustomBatchSampler(Sampler):
             if self.drop_last and len(batch_idxs) < self.batch_size:
                 continue
 
-            nSteps = random.randint(1, self.maxSteps) * self.frequency  # fixed horizon per batch
+            nSteps = random.randint(1, self.maxSteps) * self.frequency+200  # fixed horizon per batch
 
             batch_keys = []
             for idx in batch_idxs:
